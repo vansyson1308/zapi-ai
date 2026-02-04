@@ -1,0 +1,1004 @@
+openapi: 3.0.3
+info:
+  title: 2api.ai - Unified AI API
+  description: |
+    2api.ai provides a unified API to access multiple AI providers (OpenAI, Anthropic, Google) 
+    through a single interface with intelligent routing, fallback, and cost optimization.
+    
+    ## Authentication
+    All API requests require an API key passed in the `Authorization` header:
+    ```
+    Authorization: Bearer 2api_xxxxxxxxxxxx
+    ```
+    
+    ## Model Naming Convention
+    Models are specified as `provider/model-name`:
+    - `openai/gpt-4o`
+    - `anthropic/claude-3-5-sonnet`
+    - `google/gemini-1.5-pro`
+    - `auto` - Let 2api.ai choose the best model based on your routing policy
+    
+    ## Rate Limits
+    Rate limits are per API key and vary by plan. Check response headers for current limits:
+    - `X-RateLimit-Limit`: Requests allowed per minute
+    - `X-RateLimit-Remaining`: Requests remaining
+    - `X-RateLimit-Reset`: Unix timestamp when limit resets
+    
+  version: 0.1.0
+  contact:
+    email: support@2api.ai
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.2api.ai/v1
+    description: Production server
+  - url: https://staging-api.2api.ai/v1
+    description: Staging server
+
+tags:
+  - name: Chat
+    description: Chat completions API
+  - name: Embeddings
+    description: Text embeddings API
+  - name: Images
+    description: Image generation API
+  - name: Models
+    description: Model information
+  - name: Usage
+    description: Usage and billing information
+
+security:
+  - ApiKeyAuth: []
+
+# Common response headers
+x-]]response-headers:
+  X-Request-Id:
+    description: Unique request identifier (format: req_{ulid})
+    schema:
+      type: string
+      example: "req_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+  X-Trace-Id:
+    description: Distributed trace identifier
+    schema:
+      type: string
+      example: "trace_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+  X-RateLimit-Limit:
+    description: Maximum requests allowed per minute
+    schema:
+      type: integer
+  X-RateLimit-Remaining:
+    description: Requests remaining in current window
+    schema:
+      type: integer
+  X-RateLimit-Reset:
+    description: Unix timestamp when rate limit resets
+    schema:
+      type: integer
+
+paths:
+  /chat/completions:
+    post:
+      tags:
+        - Chat
+      summary: Create chat completion
+      description: |
+        Creates a chat completion for the provided messages.
+        Supports streaming, tool calling, and vision (image inputs).
+      operationId: createChatCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+            examples:
+              basic:
+                summary: Basic chat
+                value:
+                  model: "openai/gpt-4o"
+                  messages:
+                    - role: "user"
+                      content: "Hello, how are you?"
+              with_system:
+                summary: With system prompt
+                value:
+                  model: "anthropic/claude-3-5-sonnet"
+                  messages:
+                    - role: "system"
+                      content: "You are a helpful assistant."
+                    - role: "user"
+                      content: "What is 2+2?"
+              auto_routing:
+                summary: Auto routing (cost optimized)
+                value:
+                  model: "auto"
+                  messages:
+                    - role: "user"
+                      content: "Explain quantum computing"
+                  routing:
+                    strategy: "cost"
+                    max_cost: 0.05
+              with_vision:
+                summary: With image input
+                value:
+                  model: "openai/gpt-4o"
+                  messages:
+                    - role: "user"
+                      content:
+                        - type: "text"
+                          text: "What's in this image?"
+                        - type: "image_url"
+                          image_url:
+                            url: "https://example.com/image.jpg"
+              with_tools:
+                summary: With function calling
+                value:
+                  model: "openai/gpt-4o"
+                  messages:
+                    - role: "user"
+                      content: "What's the weather in Tokyo?"
+                  tools:
+                    - type: "function"
+                      function:
+                        name: "get_weather"
+                        description: "Get current weather for a location"
+                        parameters:
+                          type: "object"
+                          properties:
+                            location:
+                              type: "string"
+                              description: "City name"
+                          required: ["location"]
+      responses:
+        '200':
+          description: Successful completion
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+          headers:
+            X-Request-ID:
+              schema:
+                type: string
+              description: Unique request identifier
+            X-RateLimit-Limit:
+              schema:
+                type: integer
+            X-RateLimit-Remaining:
+              schema:
+                type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ProviderUnavailable'
+
+  /embeddings:
+    post:
+      tags:
+        - Embeddings
+      summary: Create embeddings
+      description: Creates an embedding vector representing the input text.
+      operationId: createEmbedding
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmbeddingRequest'
+            examples:
+              single:
+                summary: Single text
+                value:
+                  model: "openai/text-embedding-3-small"
+                  input: "Hello world"
+              batch:
+                summary: Batch texts
+                value:
+                  model: "openai/text-embedding-3-small"
+                  input:
+                    - "Hello world"
+                    - "How are you?"
+      responses:
+        '200':
+          description: Successful embedding
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmbeddingResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /images/generations:
+    post:
+      tags:
+        - Images
+      summary: Generate images
+      description: Creates an image given a prompt.
+      operationId: createImage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageGenerationRequest'
+            examples:
+              basic:
+                summary: Basic image generation
+                value:
+                  model: "openai/dall-e-3"
+                  prompt: "A cute cat wearing a hat"
+                  size: "1024x1024"
+      responses:
+        '200':
+          description: Successful image generation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageGenerationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /models:
+    get:
+      tags:
+        - Models
+      summary: List available models
+      description: Returns a list of all available models across all providers.
+      operationId: listModels
+      parameters:
+        - name: provider
+          in: query
+          description: Filter by provider
+          schema:
+            type: string
+            enum: [openai, anthropic, google]
+        - name: capability
+          in: query
+          description: Filter by capability
+          schema:
+            type: string
+            enum: [chat, embedding, image, vision, tools]
+      responses:
+        '200':
+          description: List of models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelListResponse'
+
+  /models/{model_id}:
+    get:
+      tags:
+        - Models
+      summary: Get model details
+      description: Returns detailed information about a specific model.
+      operationId: getModel
+      parameters:
+        - name: model_id
+          in: path
+          required: true
+          description: Model ID (e.g., openai/gpt-4o)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Model details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '404':
+          description: Model not found
+
+  /usage:
+    get:
+      tags:
+        - Usage
+      summary: Get usage statistics
+      description: Returns usage statistics for the authenticated tenant.
+      operationId: getUsage
+      parameters:
+        - name: start_date
+          in: query
+          description: Start date (YYYY-MM-DD)
+          schema:
+            type: string
+            format: date
+        - name: end_date
+          in: query
+          description: End date (YYYY-MM-DD)
+          schema:
+            type: string
+            format: date
+        - name: group_by
+          in: query
+          description: Group results by
+          schema:
+            type: string
+            enum: [day, model, provider]
+      responses:
+        '200':
+          description: Usage statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageResponse'
+
+  /health:
+    get:
+      tags:
+        - System
+      summary: Health check
+      description: Returns the health status of the API and providers.
+      operationId: healthCheck
+      security: []
+      responses:
+        '200':
+          description: System healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API Key
+      description: "API key in format: 2api_xxxxxxxxxxxx"
+
+  schemas:
+    # ==================== Chat Schemas ====================
+    ChatCompletionRequest:
+      type: object
+      required:
+        - model
+        - messages
+      properties:
+        model:
+          type: string
+          description: Model ID or "auto" for automatic selection
+          example: "openai/gpt-4o"
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+          minItems: 1
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          default: 1
+          description: Sampling temperature
+        max_tokens:
+          type: integer
+          minimum: 1
+          description: Maximum tokens to generate
+        stream:
+          type: boolean
+          default: false
+          description: Enable streaming response
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+          description: List of tools for function calling
+        tool_choice:
+          oneOf:
+            - type: string
+              enum: [auto, none, required]
+            - $ref: '#/components/schemas/ToolChoice'
+        routing:
+          $ref: '#/components/schemas/RoutingConfig'
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Custom metadata for tracking
+
+    Message:
+      type: object
+      required:
+        - role
+        - content
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                $ref: '#/components/schemas/ContentPart'
+        name:
+          type: string
+        tool_call_id:
+          type: string
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+
+    ContentPart:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum: [text, image_url]
+        text:
+          type: string
+        image_url:
+          type: object
+          properties:
+            url:
+              type: string
+              description: URL or base64 data URI
+            detail:
+              type: string
+              enum: [low, high, auto]
+              default: auto
+
+    Tool:
+      type: object
+      required:
+        - type
+        - function
+      properties:
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          required:
+            - name
+          properties:
+            name:
+              type: string
+            description:
+              type: string
+            parameters:
+              type: object
+              description: JSON Schema for parameters
+
+    ToolCall:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+              description: JSON string of arguments
+
+    ToolChoice:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          properties:
+            name:
+              type: string
+
+    RoutingConfig:
+      type: object
+      properties:
+        strategy:
+          type: string
+          enum: [cost, latency, quality]
+          description: Routing optimization strategy
+        fallback:
+          type: array
+          items:
+            type: string
+          description: Fallback model chain
+        max_latency_ms:
+          type: integer
+          description: Maximum acceptable latency
+        max_cost:
+          type: number
+          description: Maximum cost per request (USD)
+
+    ChatCompletionResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "chatcmpl-abc123"
+        object:
+          type: string
+          enum: [chat.completion]
+        created:
+          type: integer
+          description: Unix timestamp
+        model:
+          type: string
+          description: Model actually used
+        provider:
+          type: string
+          enum: [openai, anthropic, google]
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              message:
+                $ref: '#/components/schemas/Message'
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls, content_filter, error]
+        usage:
+          $ref: '#/components/schemas/Usage'
+        _2api:
+          $ref: '#/components/schemas/TwoApiMetadata'
+
+    Usage:
+      type: object
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+
+    TwoApiMetadata:
+      type: object
+      properties:
+        request_id:
+          type: string
+        latency_ms:
+          type: integer
+        cost_usd:
+          type: number
+        routing_decision:
+          type: object
+          properties:
+            strategy_used:
+              type: string
+            candidates_evaluated:
+              type: array
+              items:
+                type: string
+            fallback_used:
+              type: boolean
+
+    # ==================== Embedding Schemas ====================
+    EmbeddingRequest:
+      type: object
+      required:
+        - model
+        - input
+      properties:
+        model:
+          type: string
+          example: "openai/text-embedding-3-small"
+        input:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        encoding_format:
+          type: string
+          enum: [float, base64]
+          default: float
+        dimensions:
+          type: integer
+          description: Output dimensions (if supported by model)
+
+    EmbeddingResponse:
+      type: object
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              object:
+                type: string
+                enum: [embedding]
+              embedding:
+                type: array
+                items:
+                  type: number
+              index:
+                type: integer
+        model:
+          type: string
+        usage:
+          $ref: '#/components/schemas/Usage'
+
+    # ==================== Image Schemas ====================
+    ImageGenerationRequest:
+      type: object
+      required:
+        - model
+        - prompt
+      properties:
+        model:
+          type: string
+          example: "openai/dall-e-3"
+        prompt:
+          type: string
+          maxLength: 4000
+        n:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+        size:
+          type: string
+          enum: ["256x256", "512x512", "1024x1024", "1024x1792", "1792x1024"]
+          default: "1024x1024"
+        quality:
+          type: string
+          enum: [standard, hd]
+          default: standard
+        style:
+          type: string
+          enum: [vivid, natural]
+          default: vivid
+        response_format:
+          type: string
+          enum: [url, b64_json]
+          default: url
+
+    ImageGenerationResponse:
+      type: object
+      properties:
+        created:
+          type: integer
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              url:
+                type: string
+              b64_json:
+                type: string
+              revised_prompt:
+                type: string
+
+    # ==================== Model Schemas ====================
+    Model:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "openai/gpt-4o"
+        provider:
+          type: string
+          enum: [openai, anthropic, google]
+        name:
+          type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+            enum: [chat, embedding, image, vision, tools]
+        context_window:
+          type: integer
+          description: Maximum context length in tokens
+        max_output_tokens:
+          type: integer
+        pricing:
+          type: object
+          properties:
+            input_per_1m_tokens:
+              type: number
+              description: Cost per 1M input tokens (USD)
+            output_per_1m_tokens:
+              type: number
+              description: Cost per 1M output tokens (USD)
+
+    ModelListResponse:
+      type: object
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+
+    # ==================== Usage Schemas ====================
+    UsageResponse:
+      type: object
+      properties:
+        object:
+          type: string
+          enum: [usage]
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+              model:
+                type: string
+              provider:
+                type: string
+              requests:
+                type: integer
+              prompt_tokens:
+                type: integer
+              completion_tokens:
+                type: integer
+              total_tokens:
+                type: integer
+              cost_usd:
+                type: number
+        summary:
+          type: object
+          properties:
+            total_requests:
+              type: integer
+            total_tokens:
+              type: integer
+            total_cost_usd:
+              type: number
+
+    # ==================== System Schemas ====================
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        version:
+          type: string
+        providers:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status:
+                type: string
+                enum: [healthy, unhealthy]
+              latency_ms:
+                type: integer
+
+    # ==================== Error Schemas ====================
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+            - type
+            - request_id
+            - retryable
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: "rate_limited"
+            message:
+              type: string
+              description: Human-readable error message
+              example: "Rate limit exceeded. Please retry after 30 seconds."
+            type:
+              type: string
+              enum: [infra_error, semantic_error]
+              description: |
+                Error classification:
+                - infra_error: Platform/network issues, often retryable
+                - semantic_error: Request/content issues, client must fix
+            request_id:
+              type: string
+              description: 2api.ai request identifier
+              example: "req_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+            trace_id:
+              type: string
+              description: Distributed trace identifier
+              example: "trace_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+            provider:
+              type: string
+              description: Provider that caused the error (if applicable)
+              enum: [openai, anthropic, google]
+            provider_request_id:
+              type: string
+              description: Upstream provider's request ID
+              example: "chatcmpl-abc123xyz"
+            param:
+              type: string
+              description: Parameter that caused the error (for validation errors)
+              example: "messages"
+            retryable:
+              type: boolean
+              description: Whether client can retry the request
+            retry_after:
+              type: integer
+              description: Seconds to wait before retrying (when retryable)
+              example: 30
+            fallback_attempted:
+              type: boolean
+              description: Whether 2api.ai attempted fallback to another provider
+            partial_content:
+              type: string
+              description: Content received before failure (for streaming errors)
+            details:
+              type: object
+              additionalProperties: true
+              description: Additional error context
+
+  responses:
+    BadRequest:
+      description: Invalid request (semantic_error)
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+        X-Trace-Id:
+          schema:
+            type: string
+        X-Error-Type:
+          schema:
+            type: string
+            enum: [semantic_error]
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "missing_required_field"
+              message: "'messages' is required"
+              type: "semantic_error"
+              request_id: "req_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              trace_id: "trace_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              param: "messages"
+              retryable: false
+
+    Unauthorized:
+      description: Invalid or missing API key (semantic_error)
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+        X-Trace-Id:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "invalid_api_key"
+              message: "Invalid API key provided. Keys should start with '2api_'"
+              type: "semantic_error"
+              request_id: "req_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              trace_id: "trace_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              retryable: false
+
+    RateLimited:
+      description: Rate limit exceeded (infra_error)
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+        X-Trace-Id:
+          schema:
+            type: string
+        X-RateLimit-Limit:
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          schema:
+            type: integer
+            example: 0
+        X-RateLimit-Reset:
+          schema:
+            type: integer
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until rate limit resets
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "rate_limited"
+              message: "Rate limit exceeded. Please retry after 30 seconds."
+              type: "infra_error"
+              request_id: "req_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              trace_id: "trace_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              retryable: true
+              retry_after: 30
+              details:
+                limit_type: "rpm"
+                limit: 60
+                remaining: 0
+
+    ProviderUnavailable:
+      description: AI provider unavailable (infra_error)
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+        X-Trace-Id:
+          schema:
+            type: string
+        X-Fallback-Attempted:
+          schema:
+            type: boolean
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "upstream_503"
+              message: "OpenAI is temporarily unavailable"
+              type: "infra_error"
+              provider: "openai"
+              request_id: "req_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              trace_id: "trace_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              retryable: true
+              retry_after: 30
+              fallback_attempted: true
+
+    InternalError:
+      description: Internal server error (infra_error)
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+        X-Trace-Id:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: "internal_error"
+              message: "An unexpected error occurred"
+              type: "infra_error"
+              request_id: "req_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              trace_id: "trace_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+              retryable: true

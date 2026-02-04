@@ -1,0 +1,23 @@
+{
+  "ignorePatterns": [
+    {
+      "pattern": "^https://api.2api.ai"
+    },
+    {
+      "pattern": "^https://staging-api.2api.ai"
+    },
+    {
+      "pattern": "^https://docs.2api.ai"
+    },
+    {
+      "pattern": "^https://status.2api.ai"
+    }
+  ],
+  "replacementPatterns": [
+    {
+      "pattern": "^/",
+      "replacement": "{{BASEURL}}/"
+    }
+  ],
+  "aliveStatusCodes": [200, 206, 301, 302, 307, 308]
+}

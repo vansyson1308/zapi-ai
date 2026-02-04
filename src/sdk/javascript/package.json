@@ -1,0 +1,61 @@
+{
+  "name": "twoapi",
+  "version": "1.0.0",
+  "description": "2api.ai JavaScript SDK - Unified AI API for OpenAI, Anthropic, and Google",
+  "main": "dist/twoapi.js",
+  "module": "dist/twoapi.mjs",
+  "types": "dist/twoapi.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/twoapi.js",
+      "import": "./dist/twoapi.mjs",
+      "types": "./dist/twoapi.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup src/twoapi.ts --format cjs,esm --dts",
+    "test": "vitest",
+    "lint": "eslint src --ext .ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "openai",
+    "anthropic",
+    "claude",
+    "gemini",
+    "google",
+    "gpt",
+    "llm",
+    "api",
+    "sdk",
+    "unified",
+    "2api"
+  ],
+  "author": "2api.ai",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/2api-ai/twoapi-js"
+  },
+  "homepage": "https://2api.ai",
+  "bugs": {
+    "url": "https://github.com/2api-ai/twoapi-js/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0",
+    "eslint": "^8.55.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0"
+  }
+}
