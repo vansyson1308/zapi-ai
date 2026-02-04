@@ -26,11 +26,15 @@ from ..core.models import (
     ModelInfo,
     ModelPricing,
     Provider,
-    ProviderError,
-    APIError,
     Role,
     ToolCall,
     Usage,
+)
+from ..core.errors import (
+    TwoApiException,
+    handle_google_error,
+    create_stream_error_chunk,
+    StreamInterruptedError,
 )
 
 
@@ -111,105 +115,173 @@ class GoogleAdapter(BaseAdapter):
 
     async def chat_completion(
         self,
-        request: ChatCompletionRequest
+        request: ChatCompletionRequest,
+        request_id: str = ""
     ) -> ChatCompletionResponse:
         """Generate a chat completion using Gemini."""
-        
+
         model_name = self._resolve_model_name(request.model_name)
         payload = self._build_chat_payload(request)
-        
+
         url = f"/models/{model_name}:generateContent?key={self.api_key}"
-        
+
         start_time = time.time()
-        
+
         try:
             response = await self.client.post(url, json=payload)
             response.raise_for_status()
             data = response.json()
-        except httpx.HTTPStatusError as e:
-            raise self._handle_error(e)
-        
+        except Exception as e:
+            raise handle_google_error(e, request_id)
+
         latency_ms = int((time.time() - start_time) * 1000)
-        
+
         return self._parse_chat_response(data, model_name, latency_ms)
 
     async def chat_completion_stream(
         self,
-        request: ChatCompletionRequest
+        request: ChatCompletionRequest,
+        request_id: str = ""
     ) -> AsyncIterator[str]:
-        """Generate a streaming chat completion."""
-        
+        """
+        Generate a streaming chat completion.
+
+        IMPORTANT: Implements "no semantic drift" rule:
+        - Errors before any content: raise exception (caller can retry/fallback)
+        - Errors after content started: yield error chunk with partial_content, then stop
+        """
+
         model_name = self._resolve_model_name(request.model_name)
         payload = self._build_chat_payload(request)
-        
+
         url = f"/models/{model_name}:streamGenerateContent?key={self.api_key}&alt=sse"
-        
-        async with self.client.stream(
-            "POST",
-            url,
-            json=payload
-        ) as response:
-            async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str.strip() == "":
-                        continue
-                    
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    
-                    # Convert to OpenAI-compatible format
-                    candidates = data.get("candidates", [])
-                    if candidates:
-                        content = candidates[0].get("content", {})
-                        parts = content.get("parts", [])
-                        if parts and "text" in parts[0]:
-                            text = parts[0]["text"]
-                            chunk = {
-                                "id": f"chatcmpl-{int(time.time())}",
-                                "object": "chat.completion.chunk",
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": text},
-                                    "finish_reason": None
-                                }]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
-                        
-                        # Check for finish
-                        finish_reason = candidates[0].get("finishReason")
-                        if finish_reason:
-                            chunk = {
-                                "id": f"chatcmpl-{int(time.time())}",
-                                "object": "chat.completion.chunk",
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
-            
-            yield "data: [DONE]\n\n"
+
+        partial_content = ""
+        content_started = False
+
+        try:
+            async with self.client.stream(
+                "POST",
+                url,
+                json=payload
+            ) as response:
+                # Check for HTTP errors before streaming starts
+                if response.status_code >= 400:
+                    error_body = await response.aread()
+                    class FakeError(httpx.HTTPStatusError):
+                        def __init__(self):
+                            self.response = response
+                            self.request = response.request
+                    raise handle_google_error(FakeError(), request_id)
+
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "":
+                            continue
+
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # Check for error in response
+                        if "error" in data:
+                            error_info = data["error"]
+                            error_msg = error_info.get("message", "Unknown streaming error")
+                            if content_started:
+                                error = StreamInterruptedError(
+                                    provider="google",
+                                    partial_content=partial_content,
+                                    request_id=request_id
+                                )
+                                yield create_stream_error_chunk(error, partial_content)
+                                return
+                            else:
+                                from ..core.errors import InfraError, ErrorDetails, ErrorType
+                                raise InfraError(
+                                    ErrorDetails(
+                                        code="stream_error",
+                                        message=error_msg,
+                                        type=ErrorType.INFRA,
+                                        provider="google",
+                                        request_id=request_id,
+                                        retryable=True
+                                    ),
+                                    status_code=500
+                                )
+
+                        # Convert to OpenAI-compatible format
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            content = candidates[0].get("content", {})
+                            parts = content.get("parts", [])
+                            if parts and "text" in parts[0]:
+                                text = parts[0]["text"]
+                                content_started = True
+                                partial_content += text
+                                chunk = {
+                                    "id": f"chatcmpl-{int(time.time())}",
+                                    "object": "chat.completion.chunk",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": text},
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+
+                            # Check for finish
+                            finish_reason = candidates[0].get("finishReason")
+                            if finish_reason:
+                                chunk = {
+                                    "id": f"chatcmpl-{int(time.time())}",
+                                    "object": "chat.completion.chunk",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+
+                yield "data: [DONE]\n\n"
+
+        except TwoApiException:
+            if content_started:
+                error = StreamInterruptedError(
+                    provider="google",
+                    partial_content=partial_content,
+                    request_id=request_id
+                )
+                yield create_stream_error_chunk(error, partial_content)
+                return
+            raise
+
+        except Exception as e:
+            error = handle_google_error(e, request_id)
+            if content_started:
+                yield create_stream_error_chunk(error, partial_content)
+                return
+            raise error
 
     async def embedding(
         self,
-        request: EmbeddingRequest
+        request: EmbeddingRequest,
+        request_id: str = ""
     ) -> EmbeddingResponse:
         """Create embeddings using Google's embedding model."""
-        
+
         model_name = self._resolve_model_name(
             request.model.split("/")[-1] if "/" in request.model else request.model
         )
-        
+
         # Handle single or batch input
         inputs = request.input if isinstance(request.input, list) else [request.input]
-        
+
         embeddings = []
         total_tokens = 0
-        
+
         for i, text in enumerate(inputs):
             url = f"/models/{model_name}:embedContent?key={self.api_key}"
             payload = {
@@ -218,14 +290,14 @@ class GoogleAdapter(BaseAdapter):
                     "parts": [{"text": text}]
                 }
             }
-            
+
             try:
                 response = await self.client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
-            except httpx.HTTPStatusError as e:
-                raise self._handle_error(e)
-            
+            except Exception as e:
+                raise handle_google_error(e, request_id)
+
             embedding_values = data.get("embedding", {}).get("values", [])
             embeddings.append(
                 EmbeddingData(
@@ -235,7 +307,7 @@ class GoogleAdapter(BaseAdapter):
             )
             # Estimate tokens (rough approximation)
             total_tokens += len(text.split()) * 1.3
-        
+
         return EmbeddingResponse(
             data=embeddings,
             model=model_name,
@@ -247,16 +319,25 @@ class GoogleAdapter(BaseAdapter):
 
     async def image_generation(
         self,
-        request: ImageGenerationRequest
+        request: ImageGenerationRequest,
+        request_id: str = ""
     ) -> ImageGenerationResponse:
         """
         Generate images - Limited support via Gemini.
-        
+
         Note: For full image generation, use OpenAI DALL-E or Google Imagen.
         """
-        raise NotImplementedError(
-            "Google Gemini does not directly support image generation. "
-            "Use OpenAI (DALL-E) for image generation requests."
+        from ..core.errors import SemanticError, ErrorDetails, ErrorType
+        raise SemanticError(
+            ErrorDetails(
+                code="unsupported_operation",
+                message="Google Gemini does not support image generation. Use OpenAI (DALL-E).",
+                type=ErrorType.SEMANTIC,
+                provider="google",
+                request_id=request_id,
+                retryable=False
+            ),
+            status_code=400
         )
 
     def list_models(self) -> List[ModelInfo]:
@@ -521,29 +602,6 @@ class GoogleAdapter(BaseAdapter):
             ],
             usage=usage
         )
-
-    def _handle_error(self, error: httpx.HTTPStatusError) -> ProviderError:
-        """Convert HTTP error to ProviderError."""
-        try:
-            error_data = error.response.json()
-            error_info = error_data.get("error", {})
-            return ProviderError(
-                APIError(
-                    code=str(error_info.get("code", "unknown")),
-                    message=error_info.get("message", str(error)),
-                    type="provider_error",
-                    provider="google"
-                )
-            )
-        except Exception:
-            return ProviderError(
-                APIError(
-                    code="unknown",
-                    message=str(error),
-                    type="provider_error",
-                    provider="google"
-                )
-            )
 
     async def close(self):
         """Close the HTTP client."""

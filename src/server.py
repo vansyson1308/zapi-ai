@@ -3,6 +3,18 @@
 
 FastAPI-based API server for the unified AI interface.
 Uses canonical error layer from src/core/errors.py
+
+Supports two modes:
+- MODE=local: Development mode with relaxed auth (format-check only)
+- MODE=prod: Production mode with full DB-backed auth
+
+Features:
+- OpenAI-compatible API endpoints
+- Multi-provider support (OpenAI, Anthropic, Google)
+- Intelligent routing with fallback
+- Usage tracking and cost calculation
+- Rate limiting and quotas
+- Full observability (metrics, tracing, logging)
 """
 
 import os
@@ -10,36 +22,14 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Header, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
 
-from .core.models import (
-    ChatCompletionRequest,
-    EmbeddingRequest,
-    EmbeddingResponse,
-    ImageGenerationRequest,
-    ImageGenerationResponse,
-    Message,
-    Provider,
-    Role,
-    RoutingConfig,
-    RoutingStrategy,
-    Tool,
-    FunctionDefinition,
-    response_to_dict,
-)
+from .core.models import Provider
 from .core.errors import (
     TwoApiException,
     InfraError,
-    SemanticError,
-    InvalidAPIKeyError,
-    MissingAPIKeyError,
-    InvalidRequestError,  # ✅ FIX: was InvalidRequestErr
-    MissingRequiredFieldError,
-    RateLimitedError,
-    ProviderDownError,
     ErrorDetails,
     ErrorType,
 )
@@ -49,64 +39,32 @@ from .adapters.anthropic_adapter import AnthropicAdapter
 from .adapters.google_adapter import GoogleAdapter
 from .routing.router import Router
 
+# Auth imports
+from .auth.middleware import get_auth_context
+from .auth.config import get_auth_mode, is_local_mode, is_prod_mode
+from .db.models import AuthContext
+from .db.connection import init_db, close_db
 
-# ============================================================
-# Pydantic Models for API (request/response validation)
-# ============================================================
+# API imports - new modular routes
+from .api import (
+    management_router,
+    chat_router,
+    embeddings_router,
+    images_router,
+    models_router,
+)
 
-class MessageInput(BaseModel):
-    role: str
-    content: Any  # str or list of content parts
-    name: Optional[str] = None
-    tool_call_id: Optional[str] = None
-    tool_calls: Optional[List[Dict]] = None
+# Observability imports
+from .observability import (
+    setup_observability,
+    ObservabilityMiddleware,
+    get_metrics,
+    get_logger,
+    metrics_endpoint,
+)
 
-
-class FunctionInput(BaseModel):
-    name: str
-    description: str = ""
-    parameters: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ToolInput(BaseModel):
-    type: str = "function"
-    function: FunctionInput
-
-
-class RoutingInput(BaseModel):
-    strategy: Optional[str] = None
-    fallback: Optional[List[str]] = None
-    max_latency_ms: Optional[int] = None
-    max_cost: Optional[float] = None
-
-
-class ChatCompletionInput(BaseModel):
-    model: str
-    messages: List[MessageInput]
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    stream: bool = False
-    tools: Optional[List[ToolInput]] = None
-    tool_choice: Optional[Any] = None
-    routing: Optional[RoutingInput] = None
-    metadata: Optional[Dict[str, str]] = None
-
-
-class EmbeddingInput(BaseModel):
-    model: str
-    input: Any  # str or list of str
-    encoding_format: str = "float"
-    dimensions: Optional[int] = None
-
-
-class ImageGenerationInput(BaseModel):
-    model: str
-    prompt: str
-    n: int = 1
-    size: str = "1024x1024"
-    quality: str = "standard"
-    style: str = "vivid"
-    response_format: str = "url"
+# Usage tracking
+from .usage import get_usage_tracker, set_usage_tracker, UsageTracker
 
 
 # ============================================================
@@ -114,6 +72,7 @@ class ImageGenerationInput(BaseModel):
 # ============================================================
 
 router_instance: Optional[Router] = None
+usage_tracker: Optional[UsageTracker] = None
 
 
 # ============================================================
@@ -123,8 +82,43 @@ router_instance: Optional[Router] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
-    global router_instance
+    global router_instance, usage_tracker
 
+    mode = get_auth_mode()
+
+    # Initialize observability first (for logging during startup)
+    observability = setup_observability(
+        service_name="2api",
+        service_version="1.0.0",
+        otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+    )
+
+    logger = get_logger("server")
+    logger.info(f"2api.ai starting in {mode.value.upper()} mode")
+
+    # Initialize database in production mode
+    if is_prod_mode():
+        try:
+            db_url = os.getenv("DATABASE_URL")
+            if db_url:
+                await init_db(db_url)
+                logger.info("Database connected")
+            else:
+                logger.warning("Database not configured (set DATABASE_URL)")
+        except Exception as e:
+            logger.error(f"Database connection failed", error=str(e))
+
+    # Initialize usage tracker
+    usage_tracker = UsageTracker(
+        buffer_size=int(os.getenv("USAGE_BUFFER_SIZE", "100")),
+        flush_interval_seconds=float(os.getenv("USAGE_FLUSH_INTERVAL", "5.0"))
+    )
+    set_usage_tracker(usage_tracker)
+    await usage_tracker.start_background_flush()
+    logger.info("Usage tracker initialized")
+
+    # Initialize adapters from environment (for local mode or default)
     adapters = {}
 
     # Initialize OpenAI adapter
@@ -143,25 +137,58 @@ async def lifespan(app: FastAPI):
         adapters[Provider.GOOGLE] = GoogleAdapter(AdapterConfig(api_key=google_key))
 
     if not adapters:
-        print("WARNING: No API keys configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY")
+        logger.warning("No providers configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY")
+    else:
+        logger.info(f"Providers initialized: {', '.join(p.value for p in adapters.keys())}")
 
     router_instance = Router(adapters)
 
-    # Run health check
+    # Run health check and record metrics
+    metrics = get_metrics()
     if adapters:
         health = await router_instance.check_all_health()
         for provider, status in health.items():
-            print(f"  {provider.value}: {'✓ healthy' if status.is_healthy else '✗ unhealthy'}")
+            logger.info(
+                f"Provider health check",
+                provider=provider.value,
+                healthy=status.is_healthy,
+                latency_ms=status.avg_latency_ms,
+            )
+            # Record initial circuit breaker state
+            from .observability.metrics import CircuitState
+            metrics.set_circuit_breaker_state(
+                provider.value,
+                CircuitState.CLOSED if status.is_healthy else CircuitState.OPEN
+            )
 
-    print("2api.ai server started")
+    logger.info(
+        "2api.ai server ready",
+        auth_mode=mode.value,
+        providers=list(p.value for p in adapters.keys()),
+    )
+    if is_local_mode():
+        logger.info("Tip: Use any key starting with '2api_' (e.g., 2api_test)")
 
     yield
+
+    # Shutdown: Stop usage tracker
+    if usage_tracker:
+        await usage_tracker.stop_background_flush()
+        logger.info("Usage tracker flushed and stopped")
 
     # Shutdown: Close adapters
     for adapter in adapters.values():
         await adapter.close()
 
-    print("2api.ai server stopped")
+    # Close database
+    if is_prod_mode():
+        await close_db()
+
+    # Shutdown tracing
+    if "tracing" in observability:
+        observability["tracing"].shutdown()
+
+    logger.info("2api.ai server stopped")
 
 
 # ============================================================
@@ -172,8 +199,15 @@ app = FastAPI(
     title="2api.ai",
     description="Unified AI API - Access OpenAI, Anthropic, and Google through a single interface",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
 )
+
+# Add custom middleware (order matters - first added = outermost)
+# ObservabilityMiddleware handles metrics, tracing, and logging in one place
+app.add_middleware(ObservabilityMiddleware, service_name="2api")
 
 # CORS middleware
 app.add_middleware(
@@ -184,71 +218,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ============================================================
-# Request Context
-# ============================================================
-
-class RequestContext:
-    """Request context with tracing information."""
-    def __init__(self):
-        self.request_id = f"req_{uuid.uuid4().hex[:24]}"
-        self.trace_id = f"trace_{uuid.uuid4().hex[:24]}"
-        self.tenant_id: Optional[str] = None
-        self.api_key_id: Optional[str] = None
+# Include all routers
+app.include_router(management_router)
+app.include_router(chat_router)
+app.include_router(embeddings_router)
+app.include_router(images_router)
+app.include_router(models_router)
 
 
 # ============================================================
-# Authentication
+# Router getter (for dependency injection)
 # ============================================================
 
-async def verify_api_key(
-    authorization: Optional[str] = Header(None),
-    request: Request | None = None
-) -> tuple[str, RequestContext]:
-    """
-    Verify API key from Authorization header.
-    Returns (api_key, request_context).
-    """
-    ctx = RequestContext()
-
-    if not authorization:
-        raise MissingAPIKeyError(request_id=ctx.request_id)
-
-    # Extract bearer token
-    if authorization.startswith("Bearer "):
-        api_key = authorization[7:]
-    else:
-        api_key = authorization
-
-    # Validate key format (in production, check against database)
-    if not api_key.startswith("2api_"):
-        raise InvalidAPIKeyError(
-            message="Invalid API key format. Keys should start with '2api_'",
-            request_id=ctx.request_id
-        )
-
-    return api_key, ctx
-
-
-async def get_auth(
-    authorization: Optional[str] = Header(None)
-) -> RequestContext:
-    """Dependency that returns request context with validated auth."""
-    _, ctx = await verify_api_key(authorization=authorization)
-    return ctx
-
-
-def get_router() -> Router:
-    """Get the router instance."""
+def get_router_instance() -> Router:
+    """Get the router instance for dependency injection."""
     if router_instance is None:
-        ctx = RequestContext()
         raise InfraError(
             ErrorDetails(
                 code="service_unavailable",
                 message="Router not initialized",
                 type=ErrorType.INFRA,
-                request_id=ctx.request_id,
+                request_id="",
                 retryable=True,
                 retry_after=5
             ),
@@ -257,65 +247,19 @@ def get_router() -> Router:
     return router_instance
 
 
-def add_response_headers(response: JSONResponse, ctx: RequestContext) -> JSONResponse:
-    """Add standard headers to response."""
-    response.headers["X-Request-Id"] = ctx.request_id
-    response.headers["X-Trace-Id"] = ctx.trace_id
-    return response
+# Store in dependencies module for routes to access
+from .api import dependencies as api_deps
+api_deps._router_instance_getter = get_router_instance
 
 
 # ============================================================
-# Helper functions
-# ============================================================
-
-def convert_message_input(msg: MessageInput) -> Message:
-    """Convert API input to internal Message model."""
-    role = Role(msg.role)
-    return Message(
-        role=role,
-        content=msg.content,
-        name=msg.name,
-        tool_call_id=msg.tool_call_id
-    )
-
-
-def convert_tool_input(tool: ToolInput) -> Tool:
-    """Convert API input to internal Tool model."""
-    return Tool(
-        type=tool.type,
-        function=FunctionDefinition(
-            name=tool.function.name,
-            description=tool.function.description,
-            parameters=tool.function.parameters
-        )
-    )
-
-
-def convert_routing_input(routing: Optional[RoutingInput]) -> Optional[RoutingConfig]:
-    """Convert API input to internal RoutingConfig."""
-    if not routing:
-        return None
-
-    strategy = None
-    if routing.strategy:
-        strategy = RoutingStrategy(routing.strategy)
-
-    return RoutingConfig(
-        strategy=strategy,
-        fallback=routing.fallback,
-        max_latency_ms=routing.max_latency_ms,
-        max_cost=routing.max_cost
-    )
-
-
-# ============================================================
-# API Endpoints
+# Core Endpoints (not in routes)
 # ============================================================
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    router = get_router()
+    router = get_router_instance()
     health = await router.check_all_health()
 
     all_healthy = all(h.is_healthy for h in health.values())
@@ -323,6 +267,10 @@ async def health_check():
     return {
         "status": "healthy" if all_healthy else "degraded",
         "version": "1.0.0",
+        "mode": get_auth_mode().value,
+        "usage_tracker": {
+            "active_requests": get_usage_tracker().get_active_request_count() if usage_tracker else 0
+        },
         "providers": {
             provider.value: {
                 "status": "healthy" if h.is_healthy else "unhealthy",
@@ -333,279 +281,93 @@ async def health_check():
     }
 
 
-@app.get("/v1/models")
-async def list_models(
-    provider: Optional[str] = None,
-    capability: Optional[str] = None,
-    ctx: RequestContext = Depends(get_auth)
-):
-    """List available models."""
-    router = get_router()
-    models = router.list_all_models()
+@app.get("/metrics")
+async def prometheus_metrics():
+    """
+    Prometheus metrics endpoint.
 
-    if provider:
-        models = [m for m in models if m.provider.value == provider]
-
-    if capability:
-        models = [m for m in models if m.supports(capability)]
-
-    response = JSONResponse(content={
-        "object": "list",
-        "data": [
-            {
-                "id": m.id,
-                "provider": m.provider.value,
-                "name": m.name,
-                "capabilities": m.capabilities,
-                "context_window": m.context_window,
-                "max_output_tokens": m.max_output_tokens,
-                "pricing": {
-                    "input_per_1m_tokens": m.pricing.input_per_1m_tokens,
-                    "output_per_1m_tokens": m.pricing.output_per_1m_tokens
-                }
-            }
-            for m in models
-        ]
-    })
-    return add_response_headers(response, ctx)
+    Exposes all collected metrics in Prometheus text format.
+    Scrape this endpoint with Prometheus server.
+    """
+    return metrics_endpoint()
 
 
-@app.post("/v1/chat/completions")
-async def create_chat_completion(
-    request: Request,
-    body: ChatCompletionInput,
-    ctx: RequestContext = Depends(get_auth)
-):
-    """Create a chat completion."""
-    router = get_router()
+@app.get("/ready")
+async def readiness_check():
+    """
+    Readiness check endpoint.
 
-    messages = [convert_message_input(m) for m in body.messages]
-    tools = [convert_tool_input(t) for t in body.tools] if body.tools else None
-    routing = convert_routing_input(body.routing)
+    Returns 200 if the service is ready to accept requests.
+    Used by Kubernetes/load balancers for health checks.
+    """
+    router = get_router_instance()
+    health = await router.check_all_health()
 
-    internal_request = ChatCompletionRequest(
-        model=body.model,
-        messages=messages,
-        temperature=body.temperature,
-        max_tokens=body.max_tokens,
-        stream=body.stream,
-        tools=tools,
-        tool_choice=body.tool_choice,
-        routing=routing,
-        metadata=body.metadata
-    )
+    # Service is ready if at least one provider is healthy
+    any_healthy = any(h.is_healthy for h in health.values())
 
-    # Handle streaming
-    if body.stream:
-        async def generate():
-            # Try provider-specific adapter if model is namespaced: "openai/gpt-4o" etc.
-            if "/" in body.model:
-                provider_name = body.model.split("/")[0]
-                try:
-                    provider = Provider(provider_name)
-                    adapter = router.adapters.get(provider)
-                    if adapter:
-                        async for chunk in adapter.chat_completion_stream(internal_request):
-                            yield chunk
-                        return
-                except (ValueError, KeyError):
-                    pass
-
-            # Fallback to OpenAI if available
-            if Provider.OPENAI in router.adapters:
-                adapter = router.adapters[Provider.OPENAI]
-                async for chunk in adapter.chat_completion_stream(internal_request):
-                    yield chunk
-
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Request-Id": ctx.request_id,
-                "X-Trace-Id": ctx.trace_id
+    if not any_healthy and health:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": "No healthy providers available"
             }
         )
 
-    # Non-streaming
-    try:
-        response, decision = await router.route_chat(internal_request)
-
-        json_response = JSONResponse(
-            content=response_to_dict(response),
-            headers={
-                "X-Request-Id": ctx.request_id,
-                "X-Trace-Id": ctx.trace_id,
-                "X-Provider": response.provider,
-                "X-Latency-Ms": str(response._2api.latency_ms) if response._2api else "0",
-                "X-Cost-Usd": str(response._2api.cost_usd) if response._2api else "0",
-            }
-        )
-
-        if response._2api and response._2api.routing_decision:
-            if response._2api.routing_decision.fallback_used:
-                json_response.headers["X-Fallback-Attempted"] = "true"
-
-        return json_response
-
-    except TwoApiException:
-        raise
-    except Exception as e:
-        raise InfraError(
-            ErrorDetails(
-                code="internal_error",
-                message=str(e),
-                type=ErrorType.INFRA,
-                request_id=ctx.request_id,
-                retryable=True
-            ),
-            status_code=500
-        )
-
-
-@app.post("/v1/embeddings")
-async def create_embedding(
-    body: EmbeddingInput,
-    ctx: RequestContext = Depends(get_auth)
-):
-    """Create embeddings."""
-    router = get_router()
-
-    internal_request = EmbeddingRequest(
-        model=body.model,
-        input=body.input,
-        encoding_format=body.encoding_format,
-        dimensions=body.dimensions
-    )
-
-    try:
-        response, decision = await router.route_embedding(internal_request)
-        return add_response_headers(JSONResponse(content={
-            "object": "list",
-            "data": [
-                {
-                    "object": "embedding",
-                    "embedding": d.embedding,
-                    "index": d.index
-                }
-                for d in response.data
-            ],
-            "model": response.model,
-            "usage": {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "total_tokens": response.usage.total_tokens
-            }
-        }), ctx)
-    except NotImplementedError as e:
-        raise SemanticError(
-            ErrorDetails(
-                code="unsupported_operation",
-                message=str(e),
-                type=ErrorType.SEMANTIC,
-                request_id=ctx.request_id,
-                retryable=False
-            ),
-            status_code=400
-        )
-    except TwoApiException:
-        raise
-    except Exception as e:
-        raise InfraError(
-            ErrorDetails(
-                code="internal_error",
-                message=str(e),
-                type=ErrorType.INFRA,
-                request_id=ctx.request_id,
-                retryable=True
-            ),
-            status_code=500
-        )
-
-
-@app.post("/v1/images/generations")
-async def create_image(
-    body: ImageGenerationInput,
-    ctx: RequestContext = Depends(get_auth)
-):
-    """Generate images."""
-    router = get_router()
-
-    internal_request = ImageGenerationRequest(
-        model=body.model,
-        prompt=body.prompt,
-        n=body.n,
-        size=body.size,
-        quality=body.quality,
-        style=body.style,
-        response_format=body.response_format
-    )
-
-    try:
-        response, decision = await router.route_image(internal_request)
-        return add_response_headers(JSONResponse(content={
-            "created": response.created,
-            "data": [
-                {
-                    "url": d.url,
-                    "b64_json": d.b64_json,
-                    "revised_prompt": d.revised_prompt
-                }
-                for d in response.data
-            ]
-        }), ctx)
-    except NotImplementedError as e:
-        raise SemanticError(
-            ErrorDetails(
-                code="unsupported_operation",
-                message=str(e),
-                type=ErrorType.SEMANTIC,
-                request_id=ctx.request_id,
-                retryable=False
-            ),
-            status_code=400
-        )
-    except TwoApiException:
-        raise
-    except Exception as e:
-        raise InfraError(
-            ErrorDetails(
-                code="internal_error",
-                message=str(e),
-                type=ErrorType.INFRA,
-                request_id=ctx.request_id,
-                retryable=True
-            ),
-            status_code=500
-        )
+    return {"status": "ready"}
 
 
 @app.get("/v1/usage")
 async def get_usage(
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    group_by: Optional[str] = None,
-    ctx: RequestContext = Depends(get_auth)
+    auth: AuthContext = Depends(get_auth_context)
 ):
-    """Get usage statistics."""
-    router = get_router()
-    stats = router.get_stats()
+    """Get usage statistics for the current tenant."""
+    tracker = get_usage_tracker()
 
-    return add_response_headers(JSONResponse(content={
-        "object": "usage",
-        "data": [],
-        "summary": {
-            "providers": stats,
-            "note": "Real usage tracking requires database integration"
+    # Get in-memory usage for this tenant
+    if auth.tenant_id:
+        tenant_usage = tracker.get_tenant_usage(auth.tenant_id)
+    else:
+        tenant_usage = {
+            "tenant_id": None,
+            "total_tokens": 0,
+            "total_cost_usd": 0.0,
+            "request_count": 0
         }
-    }), ctx)
+
+    return JSONResponse(
+        content={
+            "object": "usage",
+            "tenant_id": auth.tenant_id,
+            "data": tenant_usage,
+            "note": "In-memory usage data. For historical data, query the database."
+        },
+        headers={
+            "X-Request-Id": auth.request_id,
+            "X-Trace-Id": auth.trace_id
+        }
+    )
 
 
 @app.get("/v1/stats")
-async def get_stats(ctx: RequestContext = Depends(get_auth)):
+async def get_stats(auth: AuthContext = Depends(get_auth_context)):
     """Get routing statistics."""
-    router = get_router()
-    return add_response_headers(JSONResponse(content=router.get_stats()), ctx)
+    router = get_router_instance()
+    tracker = get_usage_tracker()
+
+    return JSONResponse(
+        content={
+            "routing": router.get_stats(),
+            "usage": {
+                "active_requests": tracker.get_active_request_count()
+            }
+        },
+        headers={
+            "X-Request-Id": auth.request_id,
+            "X-Trace-Id": auth.trace_id
+        }
+    )
 
 
 # ============================================================

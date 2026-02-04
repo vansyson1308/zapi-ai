@@ -27,11 +27,15 @@ from ..core.models import (
     ModelInfo,
     ModelPricing,
     Provider,
-    ProviderError,
-    APIError,
     Role,
     ToolCall,
     Usage,
+)
+from ..core.errors import (
+    TwoApiException,
+    handle_openai_error,
+    create_stream_error_chunk,
+    StreamInterruptedError,
 )
 
 
@@ -141,73 +145,130 @@ class OpenAIAdapter(BaseAdapter):
 
     async def chat_completion(
         self,
-        request: ChatCompletionRequest
+        request: ChatCompletionRequest,
+        request_id: str = ""
     ) -> ChatCompletionResponse:
         """Generate a chat completion using OpenAI."""
-        
+
         # Build OpenAI-specific request
         payload = self._build_chat_payload(request)
-        
+
         start_time = time.time()
-        
+
         try:
             response = await self.client.post("/chat/completions", json=payload)
             response.raise_for_status()
             data = response.json()
-        except httpx.HTTPStatusError as e:
-            raise self._handle_error(e)
-        
+        except Exception as e:
+            raise handle_openai_error(e, request_id)
+
         latency_ms = int((time.time() - start_time) * 1000)
-        
+
         # Convert to unified response
         return self._parse_chat_response(data, request.model_name, latency_ms)
 
     async def chat_completion_stream(
         self,
-        request: ChatCompletionRequest
+        request: ChatCompletionRequest,
+        request_id: str = ""
     ) -> AsyncIterator[str]:
-        """Generate a streaming chat completion."""
-        
+        """
+        Generate a streaming chat completion.
+
+        IMPORTANT: Implements "no semantic drift" rule:
+        - Errors before any content: raise exception (caller can retry/fallback)
+        - Errors after content started: yield error chunk with partial_content, then stop
+        """
+
         payload = self._build_chat_payload(request)
         payload["stream"] = True
-        
-        async with self.client.stream(
-            "POST",
-            "/chat/completions",
-            json=payload
-        ) as response:
-            async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    data = line[6:]
-                    if data == "[DONE]":
-                        yield "data: [DONE]\n\n"
-                        break
-                    yield f"data: {data}\n\n"
+
+        partial_content = ""
+        content_started = False
+
+        try:
+            async with self.client.stream(
+                "POST",
+                "/chat/completions",
+                json=payload
+            ) as response:
+                # Check for HTTP errors before streaming starts
+                if response.status_code >= 400:
+                    # Read error body
+                    error_body = await response.aread()
+                    # Create a fake HTTPStatusError for our handler
+                    fake_response = response
+                    class FakeError(httpx.HTTPStatusError):
+                        def __init__(self):
+                            self.response = fake_response
+                            self.request = response.request
+                    raise handle_openai_error(FakeError(), request_id)
+
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            break
+
+                        # Track content for partial_content on error
+                        try:
+                            chunk_data = json.loads(data_str)
+                            delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                            if "content" in delta and delta["content"]:
+                                content_started = True
+                                partial_content += delta["content"]
+                        except json.JSONDecodeError:
+                            pass
+
+                        yield f"data: {data_str}\n\n"
+
+        except TwoApiException:
+            # Re-raise our own exceptions
+            if content_started:
+                # Content already sent - yield error chunk and stop
+                error = StreamInterruptedError(
+                    provider="openai",
+                    partial_content=partial_content,
+                    request_id=request_id
+                )
+                yield create_stream_error_chunk(error, partial_content)
+                return
+            raise
+
+        except Exception as e:
+            error = handle_openai_error(e, request_id)
+            if content_started:
+                # Content already sent - yield error chunk and stop
+                yield create_stream_error_chunk(error, partial_content)
+                return
+            raise error
 
     async def embedding(
         self,
-        request: EmbeddingRequest
+        request: EmbeddingRequest,
+        request_id: str = ""
     ) -> EmbeddingResponse:
         """Create embeddings using OpenAI."""
-        
+
         model_name = request.model.split("/")[-1] if "/" in request.model else request.model
-        
+
         payload: Dict[str, Any] = {
             "model": model_name,
             "input": request.input,
             "encoding_format": request.encoding_format,
         }
-        
+
         if request.dimensions:
             payload["dimensions"] = request.dimensions
-        
+
         try:
             response = await self.client.post("/embeddings", json=payload)
             response.raise_for_status()
             data = response.json()
-        except httpx.HTTPStatusError as e:
-            raise self._handle_error(e)
-        
+        except Exception as e:
+            raise handle_openai_error(e, request_id)
+
         return EmbeddingResponse(
             data=[
                 EmbeddingData(
@@ -226,12 +287,13 @@ class OpenAIAdapter(BaseAdapter):
 
     async def image_generation(
         self,
-        request: ImageGenerationRequest
+        request: ImageGenerationRequest,
+        request_id: str = ""
     ) -> ImageGenerationResponse:
         """Generate images using DALL-E."""
-        
+
         model_name = request.model.split("/")[-1] if "/" in request.model else request.model
-        
+
         payload: Dict[str, Any] = {
             "model": model_name,
             "prompt": request.prompt,
@@ -241,14 +303,14 @@ class OpenAIAdapter(BaseAdapter):
             "style": request.style,
             "response_format": request.response_format,
         }
-        
+
         try:
             response = await self.client.post("/images/generations", json=payload)
             response.raise_for_status()
             data = response.json()
-        except httpx.HTTPStatusError as e:
-            raise self._handle_error(e)
-        
+        except Exception as e:
+            raise handle_openai_error(e, request_id)
+
         return ImageGenerationResponse(
             created=data["created"],
             data=[
@@ -438,29 +500,6 @@ class OpenAIAdapter(BaseAdapter):
             ],
             usage=usage
         )
-
-    def _handle_error(self, error: httpx.HTTPStatusError) -> ProviderError:
-        """Convert HTTP error to ProviderError."""
-        try:
-            error_data = error.response.json()
-            error_info = error_data.get("error", {})
-            return ProviderError(
-                APIError(
-                    code=error_info.get("code", "unknown"),
-                    message=error_info.get("message", str(error)),
-                    type="provider_error",
-                    provider="openai"
-                )
-            )
-        except Exception:
-            return ProviderError(
-                APIError(
-                    code="unknown",
-                    message=str(error),
-                    type="provider_error",
-                    provider="openai"
-                )
-            )
 
     async def close(self):
         """Close the HTTP client."""

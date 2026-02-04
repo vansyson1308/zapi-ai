@@ -2,14 +2,14 @@
 2api.ai Python SDK - Setup
 """
 
-from setuptools import setup
+from setuptools import setup, find_packages
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
     name="twoapi",
-    version="0.1.0",
+    version="1.0.0",
     author="2api.ai",
     author_email="support@2api.ai",
     description="Unified AI API - Access OpenAI, Anthropic, and Google through a single interface",
@@ -21,7 +21,7 @@ setup(
         "Bug Tracker": "https://github.com/2api-ai/twoapi-python/issues",
     },
     classifiers=[
-        "Development Status :: 3 - Alpha",
+        "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
@@ -32,8 +32,10 @@ setup(
         "Programming Language :: Python :: 3.12",
         "Topic :: Software Development :: Libraries :: Python Modules",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        "Framework :: AsyncIO",
+        "Typing :: Typed",
     ],
-    py_modules=["twoapi"],  # Single module, not a package
+    packages=find_packages(),
     python_requires=">=3.9",
     install_requires=[
         "httpx>=0.25.0",
@@ -42,6 +44,7 @@ setup(
         "dev": [
             "pytest>=7.0.0",
             "pytest-asyncio>=0.21.0",
+            "pytest-mock>=3.10.0",
             "black>=23.0.0",
             "mypy>=1.0.0",
             "ruff>=0.1.0",
@@ -59,5 +62,8 @@ setup(
         "api",
         "sdk",
         "unified",
+        "async",
+        "tool-calling",
+        "function-calling",
     ],
 )

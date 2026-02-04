@@ -69,14 +69,16 @@ class BaseAdapter(ABC):
     @abstractmethod
     async def chat_completion(
         self,
-        request: ChatCompletionRequest
+        request: ChatCompletionRequest,
+        request_id: str = ""
     ) -> ChatCompletionResponse:
         """
         Generate a chat completion.
-        
+
         Args:
             request: Unified chat completion request
-            
+            request_id: Request ID for error tracking
+
         Returns:
             Unified chat completion response
         """
@@ -85,27 +87,35 @@ class BaseAdapter(ABC):
     @abstractmethod
     async def chat_completion_stream(
         self,
-        request: ChatCompletionRequest
+        request: ChatCompletionRequest,
+        request_id: str = ""
     ) -> AsyncIterator[str]:
         """
         Generate a streaming chat completion.
-        
+
+        Args:
+            request: Unified chat completion request
+            request_id: Request ID for error tracking
+
         Yields:
-            Server-sent events (SSE) formatted chunks
+            Server-sent events (SSE) formatted chunks.
+            On error after content started: yields error chunk with partial_content.
         """
         pass
 
     @abstractmethod
     async def embedding(
         self,
-        request: EmbeddingRequest
+        request: EmbeddingRequest,
+        request_id: str = ""
     ) -> EmbeddingResponse:
         """
         Create embeddings for input text.
-        
+
         Args:
             request: Unified embedding request
-            
+            request_id: Request ID for error tracking
+
         Returns:
             Unified embedding response
         """
@@ -114,14 +124,16 @@ class BaseAdapter(ABC):
     @abstractmethod
     async def image_generation(
         self,
-        request: ImageGenerationRequest
+        request: ImageGenerationRequest,
+        request_id: str = ""
     ) -> ImageGenerationResponse:
         """
         Generate images from a prompt.
-        
+
         Args:
             request: Unified image generation request
-            
+            request_id: Request ID for error tracking
+
         Returns:
             Unified image generation response
         """

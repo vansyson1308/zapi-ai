@@ -25,14 +25,18 @@ from ..core.models import (
     ModelInfo,
     ModelPricing,
     Provider,
-    ProviderError,
-    APIError,
     Role,
     ToolCall,
     Usage,
     ContentPart,
     TextContent,
     ImageContent,
+)
+from ..core.errors import (
+    TwoApiException,
+    handle_anthropic_error,
+    create_stream_error_chunk,
+    StreamInterruptedError,
 )
 
 
@@ -117,114 +121,196 @@ class AnthropicAdapter(BaseAdapter):
 
     async def chat_completion(
         self,
-        request: ChatCompletionRequest
+        request: ChatCompletionRequest,
+        request_id: str = ""
     ) -> ChatCompletionResponse:
         """Generate a chat completion using Claude."""
-        
+
         payload = self._build_chat_payload(request)
-        
+
         start_time = time.time()
-        
+
         try:
             response = await self.client.post("/v1/messages", json=payload)
             response.raise_for_status()
             data = response.json()
-        except httpx.HTTPStatusError as e:
-            raise self._handle_error(e)
-        
+        except Exception as e:
+            raise handle_anthropic_error(e, request_id)
+
         latency_ms = int((time.time() - start_time) * 1000)
-        
+
         return self._parse_chat_response(data, request.model_name, latency_ms)
 
     async def chat_completion_stream(
         self,
-        request: ChatCompletionRequest
+        request: ChatCompletionRequest,
+        request_id: str = ""
     ) -> AsyncIterator[str]:
-        """Generate a streaming chat completion."""
-        
+        """
+        Generate a streaming chat completion.
+
+        IMPORTANT: Implements "no semantic drift" rule:
+        - Errors before any content: raise exception (caller can retry/fallback)
+        - Errors after content started: yield error chunk with partial_content, then stop
+        """
+
         payload = self._build_chat_payload(request)
         payload["stream"] = True
-        
-        async with self.client.stream(
-            "POST",
-            "/v1/messages",
-            json=payload
-        ) as response:
-            accumulated_content = ""
-            message_id = None
-            
-            async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str.strip() == "":
-                        continue
-                    
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    
-                    event_type = data.get("type")
-                    
-                    if event_type == "message_start":
-                        message_id = data.get("message", {}).get("id")
-                    elif event_type == "content_block_delta":
-                        delta = data.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            accumulated_content += text
-                            # Convert to OpenAI-compatible SSE format
+
+        partial_content = ""
+        content_started = False
+        message_id = None
+
+        try:
+            async with self.client.stream(
+                "POST",
+                "/v1/messages",
+                json=payload
+            ) as response:
+                # Check for HTTP errors before streaming starts
+                if response.status_code >= 400:
+                    error_body = await response.aread()
+                    class FakeError(httpx.HTTPStatusError):
+                        def __init__(self):
+                            self.response = response
+                            self.request = response.request
+                    raise handle_anthropic_error(FakeError(), request_id)
+
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "":
+                            continue
+
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        event_type = data.get("type")
+
+                        # Handle Anthropic streaming errors
+                        if event_type == "error":
+                            error_data = data.get("error", {})
+                            error_msg = error_data.get("message", "Unknown streaming error")
+                            if content_started:
+                                error = StreamInterruptedError(
+                                    provider="anthropic",
+                                    partial_content=partial_content,
+                                    request_id=request_id
+                                )
+                                yield create_stream_error_chunk(error, partial_content)
+                                return
+                            else:
+                                from ..core.errors import InfraError, ErrorDetails, ErrorType
+                                raise InfraError(
+                                    ErrorDetails(
+                                        code="stream_error",
+                                        message=error_msg,
+                                        type=ErrorType.INFRA,
+                                        provider="anthropic",
+                                        request_id=request_id,
+                                        retryable=True
+                                    ),
+                                    status_code=500
+                                )
+
+                        if event_type == "message_start":
+                            message_id = data.get("message", {}).get("id")
+                        elif event_type == "content_block_delta":
+                            delta = data.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                text = delta.get("text", "")
+                                content_started = True
+                                partial_content += text
+                                # Convert to OpenAI-compatible SSE format
+                                chunk = {
+                                    "id": message_id,
+                                    "object": "chat.completion.chunk",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": text},
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                        elif event_type == "message_stop":
                             chunk = {
                                 "id": message_id,
                                 "object": "chat.completion.chunk",
                                 "choices": [{
                                     "index": 0,
-                                    "delta": {"content": text},
-                                    "finish_reason": None
+                                    "delta": {},
+                                    "finish_reason": "stop"
                                 }]
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
-                    elif event_type == "message_stop":
-                        chunk = {
-                            "id": message_id,
-                            "object": "chat.completion.chunk",
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop"
-                            }]
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
+                            yield "data: [DONE]\n\n"
+
+        except TwoApiException:
+            if content_started:
+                error = StreamInterruptedError(
+                    provider="anthropic",
+                    partial_content=partial_content,
+                    request_id=request_id
+                )
+                yield create_stream_error_chunk(error, partial_content)
+                return
+            raise
+
+        except Exception as e:
+            error = handle_anthropic_error(e, request_id)
+            if content_started:
+                yield create_stream_error_chunk(error, partial_content)
+                return
+            raise error
 
     async def embedding(
         self,
-        request: EmbeddingRequest
+        request: EmbeddingRequest,
+        request_id: str = ""
     ) -> EmbeddingResponse:
         """
         Create embeddings - NOT SUPPORTED by Anthropic.
-        
+
         Raises:
-            NotImplementedError: Anthropic does not support embeddings
+            SemanticError: Anthropic does not support embeddings
         """
-        raise NotImplementedError(
-            "Anthropic does not support embeddings. "
-            "Use OpenAI or Google for embedding requests."
+        from ..core.errors import SemanticError, ErrorDetails, ErrorType
+        raise SemanticError(
+            ErrorDetails(
+                code="unsupported_operation",
+                message="Anthropic does not support embeddings. Use OpenAI or Google.",
+                type=ErrorType.SEMANTIC,
+                provider="anthropic",
+                request_id=request_id,
+                retryable=False
+            ),
+            status_code=400
         )
 
     async def image_generation(
         self,
-        request: ImageGenerationRequest
+        request: ImageGenerationRequest,
+        request_id: str = ""
     ) -> ImageGenerationResponse:
         """
         Generate images - NOT SUPPORTED by Anthropic.
-        
+
         Raises:
-            NotImplementedError: Anthropic does not support image generation
+            SemanticError: Anthropic does not support image generation
         """
-        raise NotImplementedError(
-            "Anthropic does not support image generation. "
-            "Use OpenAI (DALL-E) for image generation requests."
+        from ..core.errors import SemanticError, ErrorDetails, ErrorType
+        raise SemanticError(
+            ErrorDetails(
+                code="unsupported_operation",
+                message="Anthropic does not support image generation. Use OpenAI (DALL-E).",
+                type=ErrorType.SEMANTIC,
+                provider="anthropic",
+                request_id=request_id,
+                retryable=False
+            ),
+            status_code=400
         )
 
     def list_models(self) -> List[ModelInfo]:
@@ -472,29 +558,6 @@ class AnthropicAdapter(BaseAdapter):
             ],
             usage=usage
         )
-
-    def _handle_error(self, error: httpx.HTTPStatusError) -> ProviderError:
-        """Convert HTTP error to ProviderError."""
-        try:
-            error_data = error.response.json()
-            error_info = error_data.get("error", {})
-            return ProviderError(
-                APIError(
-                    code=error_info.get("type", "unknown"),
-                    message=error_info.get("message", str(error)),
-                    type="provider_error",
-                    provider="anthropic"
-                )
-            )
-        except Exception:
-            return ProviderError(
-                APIError(
-                    code="unknown",
-                    message=str(error),
-                    type="provider_error",
-                    provider="anthropic"
-                )
-            )
 
     async def close(self):
         """Close the HTTP client."""

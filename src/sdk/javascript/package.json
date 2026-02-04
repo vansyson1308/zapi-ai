@@ -2,14 +2,14 @@
   "name": "twoapi",
   "version": "1.0.0",
   "description": "2api.ai JavaScript SDK - Unified AI API for OpenAI, Anthropic, and Google",
-  "main": "dist/twoapi.js",
-  "module": "dist/twoapi.mjs",
-  "types": "dist/twoapi.d.ts",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "require": "./dist/twoapi.js",
-      "import": "./dist/twoapi.mjs",
-      "types": "./dist/twoapi.d.ts"
+      "require": "./dist/index.js",
+      "import": "./dist/index.mjs",
+      "types": "./dist/index.d.ts"
     }
   },
   "files": [
@@ -17,9 +17,12 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup src/twoapi.ts --format cjs,esm --dts",
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
     "test": "vitest",
+    "test:run": "vitest run",
     "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

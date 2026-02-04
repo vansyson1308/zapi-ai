@@ -500,11 +500,11 @@ def create_error_from_provider(
     provider_request_id: str = ""
 ) -> TwoApiException:
     """Create appropriate error from provider response."""
-    
+
     message = error_body.get("message", str(error_body))
     error_type = error_body.get("type", "")
     error_code = error_body.get("code", "")
-    
+
     # Map common provider errors
     if status_code == 401:
         return SemanticError(
@@ -518,22 +518,22 @@ def create_error_from_provider(
             ),
             status_code=502
         )
-    
+
     if status_code == 429:
         retry_after = 60
         if "retry-after" in error_body:
             retry_after = int(error_body["retry-after"])
         return RateLimitedError(provider, retry_after, request_id=request_id)
-    
+
     if status_code >= 500:
         return UpstreamError(
             provider, status_code, message,
             request_id, provider_request_id
         )
-    
+
     if "content" in error_code.lower() or "safety" in error_type.lower():
         return ContentFilteredError(provider, error_type, request_id)
-    
+
     if "context" in message.lower() or "token" in message.lower():
         return SemanticError(
             ErrorDetails(
@@ -546,7 +546,7 @@ def create_error_from_provider(
             ),
             status_code=400
         )
-    
+
     # Default: treat as semantic error from provider
     return SemanticError(
         ErrorDetails(
@@ -559,4 +559,515 @@ def create_error_from_provider(
             retryable=False
         ),
         status_code=status_code if status_code < 500 else 400
+    )
+
+
+# ============================================================
+# Provider-specific error handlers
+# ============================================================
+
+def handle_openai_error(
+    error: Exception,
+    request_id: str = ""
+) -> TwoApiException:
+    """
+    Convert OpenAI HTTP error to canonical 2api exception.
+
+    OpenAI error format:
+    {
+        "error": {
+            "message": "...",
+            "type": "invalid_request_error|authentication_error|...",
+            "code": "invalid_api_key|model_not_found|...",
+            "param": "..."
+        }
+    }
+    """
+    import httpx
+
+    provider = "openai"
+
+    # Handle httpx errors
+    if isinstance(error, httpx.TimeoutException):
+        if isinstance(error, httpx.ConnectTimeout):
+            return ConnectionTimeoutError(provider, request_id)
+        return ReadTimeoutError(provider, request_id)
+
+    if isinstance(error, httpx.ConnectError):
+        return ConnectionTimeoutError(provider, request_id)
+
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+
+        try:
+            error_data = error.response.json()
+            error_info = error_data.get("error", {})
+            message = error_info.get("message", str(error))
+            error_type = error_info.get("type", "")
+            error_code = error_info.get("code", "")
+            param = error_info.get("param")
+            provider_req_id = error.response.headers.get("x-request-id", "")
+        except Exception:
+            message = str(error)
+            error_type = ""
+            error_code = ""
+            param = None
+            provider_req_id = ""
+
+        # 401 - Authentication
+        if status_code == 401:
+            return SemanticError(
+                ErrorDetails(
+                    code="provider_auth_error",
+                    message=f"OpenAI authentication failed: {message}",
+                    type=ErrorType.SEMANTIC,
+                    provider=provider,
+                    request_id=request_id,
+                    provider_request_id=provider_req_id or None,
+                    retryable=False
+                ),
+                status_code=502
+            )
+
+        # 403 - Permission denied
+        if status_code == 403:
+            return SemanticError(
+                ErrorDetails(
+                    code="permission_denied",
+                    message=message,
+                    type=ErrorType.SEMANTIC,
+                    provider=provider,
+                    request_id=request_id,
+                    provider_request_id=provider_req_id or None,
+                    retryable=False
+                ),
+                status_code=403
+            )
+
+        # 429 - Rate limit
+        if status_code == 429:
+            retry_after = 60
+            if "retry-after" in error.response.headers:
+                try:
+                    retry_after = int(error.response.headers["retry-after"])
+                except ValueError:
+                    pass
+            return RateLimitedError(provider, retry_after, request_id=request_id)
+
+        # 5xx - Server errors (infra, retryable)
+        if status_code >= 500:
+            return UpstreamError(
+                provider, status_code, message,
+                request_id, provider_req_id
+            )
+
+        # 400 - Bad request - check specific error types
+        if status_code == 400:
+            # Content filter
+            if error_code == "content_policy_violation" or "content" in error_type.lower():
+                return ContentFilteredError(provider, message, request_id)
+
+            # Context length
+            if "context_length" in error_code or "maximum context" in message.lower():
+                return SemanticError(
+                    ErrorDetails(
+                        code="context_length_exceeded",
+                        message=message,
+                        type=ErrorType.SEMANTIC,
+                        provider=provider,
+                        param=param,
+                        request_id=request_id,
+                        provider_request_id=provider_req_id or None,
+                        retryable=False
+                    ),
+                    status_code=400
+                )
+
+            # Invalid request
+            return InvalidRequestError(message, param or "", request_id)
+
+        # 404 - Model not found
+        if status_code == 404:
+            if "model" in message.lower():
+                return ModelNotFoundError(error_code or "unknown", request_id)
+            return SemanticError(
+                ErrorDetails(
+                    code="not_found",
+                    message=message,
+                    type=ErrorType.SEMANTIC,
+                    provider=provider,
+                    request_id=request_id,
+                    retryable=False
+                ),
+                status_code=404
+            )
+
+        # Default semantic error for other 4xx
+        return SemanticError(
+            ErrorDetails(
+                code=error_code or "provider_error",
+                message=message,
+                type=ErrorType.SEMANTIC,
+                provider=provider,
+                param=param,
+                request_id=request_id,
+                provider_request_id=provider_req_id or None,
+                retryable=False
+            ),
+            status_code=status_code
+        )
+
+    # Unknown error
+    return InfraError(
+        ErrorDetails(
+            code="unknown_error",
+            message=str(error),
+            type=ErrorType.INFRA,
+            provider=provider,
+            request_id=request_id,
+            retryable=True
+        ),
+        status_code=500
+    )
+
+
+def handle_anthropic_error(
+    error: Exception,
+    request_id: str = ""
+) -> TwoApiException:
+    """
+    Convert Anthropic HTTP error to canonical 2api exception.
+
+    Anthropic error format:
+    {
+        "type": "error",
+        "error": {
+            "type": "authentication_error|invalid_request_error|...",
+            "message": "..."
+        }
+    }
+    """
+    import httpx
+
+    provider = "anthropic"
+
+    # Handle httpx errors
+    if isinstance(error, httpx.TimeoutException):
+        if isinstance(error, httpx.ConnectTimeout):
+            return ConnectionTimeoutError(provider, request_id)
+        return ReadTimeoutError(provider, request_id)
+
+    if isinstance(error, httpx.ConnectError):
+        return ConnectionTimeoutError(provider, request_id)
+
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+
+        try:
+            error_data = error.response.json()
+            error_info = error_data.get("error", {})
+            message = error_info.get("message", str(error))
+            error_type = error_info.get("type", "")
+            provider_req_id = error.response.headers.get("request-id", "")
+        except Exception:
+            message = str(error)
+            error_type = ""
+            provider_req_id = ""
+
+        # 401 - Authentication
+        if status_code == 401 or error_type == "authentication_error":
+            return SemanticError(
+                ErrorDetails(
+                    code="provider_auth_error",
+                    message=f"Anthropic authentication failed: {message}",
+                    type=ErrorType.SEMANTIC,
+                    provider=provider,
+                    request_id=request_id,
+                    provider_request_id=provider_req_id or None,
+                    retryable=False
+                ),
+                status_code=502
+            )
+
+        # 403 - Permission denied
+        if status_code == 403 or error_type == "permission_error":
+            return SemanticError(
+                ErrorDetails(
+                    code="permission_denied",
+                    message=message,
+                    type=ErrorType.SEMANTIC,
+                    provider=provider,
+                    request_id=request_id,
+                    provider_request_id=provider_req_id or None,
+                    retryable=False
+                ),
+                status_code=403
+            )
+
+        # 429 - Rate limit or overloaded
+        if status_code == 429 or error_type == "rate_limit_error":
+            retry_after = 60
+            if "retry-after" in error.response.headers:
+                try:
+                    retry_after = int(error.response.headers["retry-after"])
+                except ValueError:
+                    pass
+            return RateLimitedError(provider, retry_after, request_id=request_id)
+
+        # 529 - Anthropic overloaded
+        if status_code == 529 or error_type == "overloaded_error":
+            return UpstreamError(
+                provider, 503, "Anthropic is temporarily overloaded",
+                request_id, provider_req_id
+            )
+
+        # 5xx - Server errors
+        if status_code >= 500:
+            return UpstreamError(
+                provider, status_code, message,
+                request_id, provider_req_id
+            )
+
+        # 400 - Bad request
+        if status_code == 400 or error_type == "invalid_request_error":
+            # Content filter / safety
+            if "safety" in message.lower() or "content" in message.lower():
+                return ContentFilteredError(provider, message, request_id)
+
+            # Context length
+            if "token" in message.lower() and ("limit" in message.lower() or "exceed" in message.lower()):
+                return SemanticError(
+                    ErrorDetails(
+                        code="context_length_exceeded",
+                        message=message,
+                        type=ErrorType.SEMANTIC,
+                        provider=provider,
+                        request_id=request_id,
+                        provider_request_id=provider_req_id or None,
+                        retryable=False
+                    ),
+                    status_code=400
+                )
+
+            return InvalidRequestError(message, "", request_id)
+
+        # 404 - Not found (model)
+        if status_code == 404 or error_type == "not_found_error":
+            return ModelNotFoundError("unknown", request_id)
+
+        # Default
+        return SemanticError(
+            ErrorDetails(
+                code=error_type or "provider_error",
+                message=message,
+                type=ErrorType.SEMANTIC,
+                provider=provider,
+                request_id=request_id,
+                provider_request_id=provider_req_id or None,
+                retryable=False
+            ),
+            status_code=status_code
+        )
+
+    # Unknown error
+    return InfraError(
+        ErrorDetails(
+            code="unknown_error",
+            message=str(error),
+            type=ErrorType.INFRA,
+            provider=provider,
+            request_id=request_id,
+            retryable=True
+        ),
+        status_code=500
+    )
+
+
+def handle_google_error(
+    error: Exception,
+    request_id: str = ""
+) -> TwoApiException:
+    """
+    Convert Google Gemini HTTP error to canonical 2api exception.
+
+    Google error format:
+    {
+        "error": {
+            "code": 400,
+            "message": "...",
+            "status": "INVALID_ARGUMENT|PERMISSION_DENIED|..."
+        }
+    }
+    """
+    import httpx
+
+    provider = "google"
+
+    # Handle httpx errors
+    if isinstance(error, httpx.TimeoutException):
+        if isinstance(error, httpx.ConnectTimeout):
+            return ConnectionTimeoutError(provider, request_id)
+        return ReadTimeoutError(provider, request_id)
+
+    if isinstance(error, httpx.ConnectError):
+        return ConnectionTimeoutError(provider, request_id)
+
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+
+        try:
+            error_data = error.response.json()
+            error_info = error_data.get("error", {})
+            message = error_info.get("message", str(error))
+            error_status = error_info.get("status", "")
+            error_code = str(error_info.get("code", ""))
+        except Exception:
+            message = str(error)
+            error_status = ""
+            error_code = ""
+
+        # 401/403 - Authentication / Permission
+        if status_code == 401 or error_status == "UNAUTHENTICATED":
+            return SemanticError(
+                ErrorDetails(
+                    code="provider_auth_error",
+                    message=f"Google authentication failed: {message}",
+                    type=ErrorType.SEMANTIC,
+                    provider=provider,
+                    request_id=request_id,
+                    retryable=False
+                ),
+                status_code=502
+            )
+
+        if status_code == 403 or error_status == "PERMISSION_DENIED":
+            return SemanticError(
+                ErrorDetails(
+                    code="permission_denied",
+                    message=message,
+                    type=ErrorType.SEMANTIC,
+                    provider=provider,
+                    request_id=request_id,
+                    retryable=False
+                ),
+                status_code=403
+            )
+
+        # 429 - Rate limit
+        if status_code == 429 or error_status == "RESOURCE_EXHAUSTED":
+            retry_after = 60
+            if "retry-after" in error.response.headers:
+                try:
+                    retry_after = int(error.response.headers["retry-after"])
+                except ValueError:
+                    pass
+            return RateLimitedError(provider, retry_after, request_id=request_id)
+
+        # 5xx - Server errors
+        if status_code >= 500 or error_status in ["INTERNAL", "UNAVAILABLE"]:
+            return UpstreamError(
+                provider, status_code, message,
+                request_id, ""
+            )
+
+        # 400 - Bad request
+        if status_code == 400 or error_status == "INVALID_ARGUMENT":
+            # Safety filter
+            if "safety" in message.lower() or "blocked" in message.lower():
+                return ContentFilteredError(provider, message, request_id)
+
+            # Token limit
+            if "token" in message.lower() and "limit" in message.lower():
+                return SemanticError(
+                    ErrorDetails(
+                        code="context_length_exceeded",
+                        message=message,
+                        type=ErrorType.SEMANTIC,
+                        provider=provider,
+                        request_id=request_id,
+                        retryable=False
+                    ),
+                    status_code=400
+                )
+
+            return InvalidRequestError(message, "", request_id)
+
+        # 404 - Not found
+        if status_code == 404 or error_status == "NOT_FOUND":
+            return ModelNotFoundError("unknown", request_id)
+
+        # Default
+        return SemanticError(
+            ErrorDetails(
+                code=error_status.lower() if error_status else "provider_error",
+                message=message,
+                type=ErrorType.SEMANTIC,
+                provider=provider,
+                request_id=request_id,
+                retryable=False
+            ),
+            status_code=status_code
+        )
+
+    # Unknown error
+    return InfraError(
+        ErrorDetails(
+            code="unknown_error",
+            message=str(error),
+            type=ErrorType.INFRA,
+            provider=provider,
+            request_id=request_id,
+            retryable=True
+        ),
+        status_code=500
+    )
+
+
+# ============================================================
+# Streaming error helpers
+# ============================================================
+
+def create_stream_error_chunk(
+    error: TwoApiException,
+    partial_content: str = ""
+) -> str:
+    """
+    Create SSE error chunk for streaming errors.
+
+    When an error occurs during streaming, we send one final error chunk
+    with any partial content received, then terminate the stream.
+
+    Returns SSE-formatted error string.
+    """
+    import json
+
+    # Update error with partial content if provided
+    if partial_content:
+        error.error.partial_content = partial_content
+
+    error_chunk = {
+        "error": error.error.to_dict()["error"],
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "error"
+        }]
+    }
+
+    return f"data: {json.dumps(error_chunk)}\n\ndata: [DONE]\n\n"
+
+
+def is_retryable_before_content(error: TwoApiException) -> bool:
+    """
+    Check if error is retryable BEFORE any content has been produced.
+
+    This is critical for semantic drift prevention:
+    - Infra errors before content: can retry/fallback
+    - Any error after content started: NO retry/fallback
+    """
+    return (
+        isinstance(error, InfraError) and
+        error.error.retryable and
+        not error.error.partial_content
     )
