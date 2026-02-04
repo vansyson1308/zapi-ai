@@ -2,28 +2,28 @@ openapi: 3.0.3
 info:
   title: 2api.ai - Unified AI API
   description: |
-    2api.ai provides a unified API to access multiple AI providers (OpenAI, Anthropic, Google) 
+    2api.ai provides a unified API to access multiple AI providers (OpenAI, Anthropic, Google)
     through a single interface with intelligent routing, fallback, and cost optimization.
-    
+
     ## Authentication
     All API requests require an API key passed in the `Authorization` header:
     ```
     Authorization: Bearer 2api_xxxxxxxxxxxx
     ```
-    
+
     ## Model Naming Convention
     Models are specified as `provider/model-name`:
     - `openai/gpt-4o`
     - `anthropic/claude-3-5-sonnet`
     - `google/gemini-1.5-pro`
     - `auto` - Let 2api.ai choose the best model based on your routing policy
-    
+
     ## Rate Limits
     Rate limits are per API key and vary by plan. Check response headers for current limits:
     - `X-RateLimit-Limit`: Requests allowed per minute
     - `X-RateLimit-Remaining`: Requests remaining
     - `X-RateLimit-Reset`: Unix timestamp when limit resets
-    
+
   version: 0.1.0
   contact:
     email: support@2api.ai
@@ -47,34 +47,11 @@ tags:
     description: Model information
   - name: Usage
     description: Usage and billing information
+  - name: System
+    description: Health and system endpoints
 
 security:
   - ApiKeyAuth: []
-
-# Common response headers
-x-]]response-headers:
-  X-Request-Id:
-    description: Unique request identifier (format: req_{ulid})
-    schema:
-      type: string
-      example: "req_01HQ3K5V8YCJN4XWZP0QRMVT6B"
-  X-Trace-Id:
-    description: Distributed trace identifier
-    schema:
-      type: string
-      example: "trace_01HQ3K5V8YCJN4XWZP0QRMVT6B"
-  X-RateLimit-Limit:
-    description: Maximum requests allowed per minute
-    schema:
-      type: integer
-  X-RateLimit-Remaining:
-    description: Requests remaining in current window
-    schema:
-      type: integer
-  X-RateLimit-Reset:
-    description: Unix timestamp when rate limit resets
-    schema:
-      type: integer
 
 paths:
   /chat/completions:
@@ -158,16 +135,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/ChatCompletionResponse'
           headers:
-            X-Request-ID:
-              schema:
-                type: string
-              description: Unique request identifier
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            X-Trace-Id:
+              $ref: '#/components/headers/X-Trace-Id'
             X-RateLimit-Limit:
-              schema:
-                type: integer
+              $ref: '#/components/headers/X-RateLimit-Limit'
             X-RateLimit-Remaining:
-              schema:
-                type: integer
+              $ref: '#/components/headers/X-RateLimit-Remaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/X-RateLimit-Reset'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -354,6 +331,30 @@ paths:
                 $ref: '#/components/schemas/HealthResponse'
 
 components:
+  headers:
+    X-Request-Id:
+      description: "Unique request identifier (format: req_{ulid})"
+      schema:
+        type: string
+        example: "req_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+    X-Trace-Id:
+      description: "Distributed trace identifier (format: trace_{ulid})"
+      schema:
+        type: string
+        example: "trace_01HQ3K5V8YCJN4XWZP0QRMVT6B"
+    X-RateLimit-Limit:
+      description: "Maximum requests allowed per minute"
+      schema:
+        type: integer
+    X-RateLimit-Remaining:
+      description: "Requests remaining in current window"
+      schema:
+        type: integer
+    X-RateLimit-Reset:
+      description: "Unix timestamp when rate limit resets"
+      schema:
+        type: integer
+
   securitySchemes:
     ApiKeyAuth:
       type: http
@@ -362,7 +363,6 @@ components:
       description: "API key in format: 2api_xxxxxxxxxxxx"
 
   schemas:
-    # ==================== Chat Schemas ====================
     ChatCompletionRequest:
       type: object
       required:
@@ -591,7 +591,6 @@ components:
             fallback_used:
               type: boolean
 
-    # ==================== Embedding Schemas ====================
     EmbeddingRequest:
       type: object
       required:
@@ -640,7 +639,6 @@ components:
         usage:
           $ref: '#/components/schemas/Usage'
 
-    # ==================== Image Schemas ====================
     ImageGenerationRequest:
       type: object
       required:
@@ -692,7 +690,6 @@ components:
               revised_prompt:
                 type: string
 
-    # ==================== Model Schemas ====================
     Model:
       type: object
       properties:
@@ -735,7 +732,6 @@ components:
           items:
             $ref: '#/components/schemas/Model'
 
-    # ==================== Usage Schemas ====================
     UsageResponse:
       type: object
       properties:
@@ -774,7 +770,6 @@ components:
             total_cost_usd:
               type: number
 
-    # ==================== System Schemas ====================
     HealthResponse:
       type: object
       properties:
@@ -794,7 +789,6 @@ components:
               latency_ms:
                 type: integer
 
-    # ==================== Error Schemas ====================
     Error:
       type: object
       required:
@@ -867,11 +861,9 @@ components:
       description: Invalid request (semantic_error)
       headers:
         X-Request-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Request-Id'
         X-Trace-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Trace-Id'
         X-Error-Type:
           schema:
             type: string
@@ -894,11 +886,9 @@ components:
       description: Invalid or missing API key (semantic_error)
       headers:
         X-Request-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Request-Id'
         X-Trace-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Trace-Id'
       content:
         application/json:
           schema:
@@ -916,21 +906,15 @@ components:
       description: Rate limit exceeded (infra_error)
       headers:
         X-Request-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Request-Id'
         X-Trace-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Trace-Id'
         X-RateLimit-Limit:
-          schema:
-            type: integer
+          $ref: '#/components/headers/X-RateLimit-Limit'
         X-RateLimit-Remaining:
-          schema:
-            type: integer
-            example: 0
+          $ref: '#/components/headers/X-RateLimit-Remaining'
         X-RateLimit-Reset:
-          schema:
-            type: integer
+          $ref: '#/components/headers/X-RateLimit-Reset'
         Retry-After:
           schema:
             type: integer
@@ -957,11 +941,9 @@ components:
       description: AI provider unavailable (infra_error)
       headers:
         X-Request-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Request-Id'
         X-Trace-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Trace-Id'
         X-Fallback-Attempted:
           schema:
             type: boolean
@@ -985,11 +967,9 @@ components:
       description: Internal server error (infra_error)
       headers:
         X-Request-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Request-Id'
         X-Trace-Id:
-          schema:
-            type: string
+          $ref: '#/components/headers/X-Trace-Id'
       content:
         application/json:
           schema:
