@@ -67,9 +67,11 @@ This repository is for developers who want a **single-instance, dev-first AI gat
 - ✅ Local development, integration testing, and single-instance deployments.
 - ❌ Multi-instance SaaS hardening (distributed rate limits, HA state coordination, global failover) is out of scope in this repository.
 
-## Quickstart (3 commands)
+## Quickstart (5 commands)
 
 ```bash
+git clone https://github.com/vansyson1308/zapi-ai.git
+cd zapi-ai
 make doctor
 make dev
 make smoke-journey
