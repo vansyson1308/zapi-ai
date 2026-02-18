@@ -28,6 +28,7 @@ from src.core.models import (
 from src.db.models import APIKey, AuthContext, Tenant
 from src.usage import limits as limits_module
 from src.usage.limits import UsageLimiter
+from src.usage import QuotaConfig, UsageLimit, LimitType, LimitPeriod, set_quota
 
 
 class _FakeRouter:
@@ -178,3 +179,57 @@ def test_rate_limits_are_tenant_aware():
     # Tenant2 remains unaffected
     t2 = client.post("/v1/chat/completions", json=payload, headers={"Authorization": "Bearer 2api_tenant2"})
     assert t2.status_code == 200
+
+
+def _set_rpm_quota_for_auth(auth: AuthContext, rpm: int = 2) -> None:
+    set_quota(
+        QuotaConfig(
+            tenant_id=str(auth.tenant_id),
+            plan=getattr(auth.tenant, "plan", "free"),
+            limits=[
+                UsageLimit(LimitType.RATE, LimitPeriod.MINUTE, rpm),
+                UsageLimit(LimitType.TOKENS, LimitPeriod.DAY, 1_000_000),
+                UsageLimit(LimitType.COST, LimitPeriod.MONTH, 1_000.0),
+            ],
+        )
+    )
+
+
+def test_local_mode_with_strict_local_guards_enforces_rate_limits(monkeypatch):
+    monkeypatch.setenv("MODE", "local")
+    monkeypatch.setenv("STRICT_LOCAL_GUARDS", "true")
+
+    auth = _auth_context_for_tenant("31", plan="free")
+    _set_rpm_quota_for_auth(auth, rpm=2)
+
+    app = _build_test_app(_FakeRouter(), lambda: auth)
+    app.include_router(chat_router)
+
+    client = TestClient(app)
+    payload = {"model": "auto", "messages": [{"role": "user", "content": "hello"}], "stream": False}
+
+    assert client.post("/v1/chat/completions", json=payload).status_code == 200
+    assert client.post("/v1/chat/completions", json=payload).status_code == 200
+
+    third = client.post("/v1/chat/completions", json=payload)
+    assert third.status_code == 429
+    assert "Retry-After" in third.headers
+
+
+def test_local_mode_without_strict_local_guards_keeps_rate_limit_bypass(monkeypatch):
+    monkeypatch.setenv("MODE", "local")
+    monkeypatch.delenv("STRICT_LOCAL_GUARDS", raising=False)
+
+    auth = _auth_context_for_tenant("32", plan="free")
+    _set_rpm_quota_for_auth(auth, rpm=1)
+
+    app = _build_test_app(_FakeRouter(), lambda: auth)
+    app.include_router(chat_router)
+
+    client = TestClient(app)
+    payload = {"model": "auto", "messages": [{"role": "user", "content": "hello"}], "stream": False}
+
+    # Local default remains developer-friendly: no rate-limit enforcement shortcut disabled only when strict flag is on.
+    assert client.post("/v1/chat/completions", json=payload).status_code == 200
+    assert client.post("/v1/chat/completions", json=payload).status_code == 200
+    assert client.post("/v1/chat/completions", json=payload).status_code == 200

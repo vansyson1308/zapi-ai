@@ -58,6 +58,80 @@
 
 ---
 
+
+## Who this is for
+
+This repository is for developers who want a **single-instance, dev-first AI gateway** with OpenAI-compatible APIs, routing/fallback behavior, and SDKs that run locally with deterministic stub mode.
+
+**Explicit scope (OSS release):**
+- ✅ Local development, integration testing, and single-instance deployments.
+- ❌ Multi-instance SaaS hardening (distributed rate limits, HA state coordination, global failover) is out of scope in this repository.
+
+## Quickstart (3 commands)
+
+```bash
+make doctor
+make dev
+make smoke-journey
+```
+
+Expected output snippets:
+- `make doctor` → `Doctor checks passed.`
+- `make dev` → `✅ Server ready: http://127.0.0.1:8000`
+- `make smoke-journey` → `Smoke user journey completed successfully.`
+
+## Using real providers
+
+1) Copy and edit environment config:
+
+```bash
+cp .env.example .env
+```
+
+2) Set required values in `.env` (at least one provider key):
+
+```bash
+MODE=local
+USE_STUB_ADAPTERS=false
+OPENAI_API_KEY=sk-...
+# or ANTHROPIC_API_KEY=sk-ant-...
+# or GOOGLE_API_KEY=AIza...
+```
+
+3) Start server and call API:
+
+```bash
+make dev
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer 2api_test" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Hello from real provider"}]}'
+```
+
+## Troubleshooting (top 6)
+
+1. **Port already in use (`address already in use`)**
+   - Fix: change port (`PORT=8011 make dev`) or stop the conflicting process.
+2. **Missing env vars / startup guard failures**
+   - Fix: run `make doctor`; for local deterministic mode use `MODE=local USE_STUB_ADAPTERS=true`.
+3. **401/403 auth errors**
+   - Fix: include `Authorization: Bearer 2api_<token>` on all `/v1/*` calls.
+4. **Proxy/pip warnings during installs**
+   - Fix: this can be environment-level; retry in a network-enabled shell or configure `HTTPS_PROXY`/`NO_PROXY` correctly.
+5. **Node tooling issues**
+   - Fix: use Node 18+ (`node -v`) to run JS SDK checks.
+6. **Windows path/process issues**
+   - Fix: run inside WSL2 for parity with the documented Linux/macOS flow.
+
+## Support policy
+
+For bug reports, include:
+- OS and shell
+- Python and Node versions
+- `make doctor` output
+- `make ci` output
+- Minimal reproduction steps/logs
+
 ## Quick Start
 
 ### One-command quality gate (from clean checkout)
@@ -490,6 +564,8 @@ GOOGLE_API_KEY=AI...
 # Server
 PORT=8000
 MODE=prod  # safe default; set MODE=local explicitly for local dev
+# Optional: set true to enforce production-like guards while in local mode
+STRICT_LOCAL_GUARDS=false
 
 # Secret encryption for tenant provider keys
 FERNET_KEY=<generated_fernet_key>
@@ -573,6 +649,8 @@ make dev
 ```
 
 This starts the API in `MODE=local` with stub adapters, waits until `/ready` returns 200, and prints the base URL plus suggested next commands.
+
+For staging-like local validation, run with `STRICT_LOCAL_GUARDS=true` to disable local control shortcuts (for example, rate-limit bypass).
 
 ### Quality gate
 

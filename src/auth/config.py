@@ -69,6 +69,12 @@ def is_test_mode() -> bool:
     return get_auth_mode() == AuthMode.TEST
 
 
+def is_strict_local_guards_enabled() -> bool:
+    """Enable production-like guard enforcement while MODE=local."""
+    raw = os.getenv("STRICT_LOCAL_GUARDS", "false").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def get_cors_allowed_origins() -> List[str]:
     """Parse CORS_ALLOW_ORIGINS from environment."""
     raw = os.getenv("CORS_ALLOW_ORIGINS", "")
