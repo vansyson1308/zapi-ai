@@ -37,11 +37,18 @@ from .adapters.base import AdapterConfig
 from .adapters.openai_adapter import OpenAIAdapter
 from .adapters.anthropic_adapter import AnthropicAdapter
 from .adapters.google_adapter import GoogleAdapter
+from .adapters.stub_adapter import StubAdapter
 from .routing.router import Router
 
 # Auth imports
 from .auth.middleware import get_auth_context
-from .auth.config import get_auth_mode, is_local_mode, is_prod_mode
+from .auth.config import (
+    get_auth_mode,
+    is_local_mode,
+    is_prod_mode,
+    get_cors_allowed_origins,
+    validate_security_config,
+)
 from .db.models import AuthContext
 from .db.connection import init_db, close_db
 
@@ -86,6 +93,9 @@ async def lifespan(app: FastAPI):
 
     mode = get_auth_mode()
 
+    # Fail closed on unsafe production settings.
+    validate_security_config()
+
     # Initialize observability first (for logging during startup)
     observability = setup_observability(
         service_name="2api",
@@ -121,20 +131,26 @@ async def lifespan(app: FastAPI):
     # Initialize adapters from environment (for local mode or default)
     adapters = {}
 
-    # Initialize OpenAI adapter
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if openai_key:
-        adapters[Provider.OPENAI] = OpenAIAdapter(AdapterConfig(api_key=openai_key))
+    use_stub_adapters = os.getenv("USE_STUB_ADAPTERS", "false").lower() in {"1", "true", "yes"}
 
-    # Initialize Anthropic adapter
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-    if anthropic_key:
-        adapters[Provider.ANTHROPIC] = AnthropicAdapter(AdapterConfig(api_key=anthropic_key))
+    if use_stub_adapters:
+        adapters[Provider.OPENAI] = StubAdapter(AdapterConfig(api_key="stub"))
+        logger.info("Using stub adapter mode (deterministic, no external calls)")
+    else:
+        # Initialize OpenAI adapter
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            adapters[Provider.OPENAI] = OpenAIAdapter(AdapterConfig(api_key=openai_key))
 
-    # Initialize Google adapter
-    google_key = os.getenv("GOOGLE_API_KEY")
-    if google_key:
-        adapters[Provider.GOOGLE] = GoogleAdapter(AdapterConfig(api_key=google_key))
+        # Initialize Anthropic adapter
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        if anthropic_key:
+            adapters[Provider.ANTHROPIC] = AnthropicAdapter(AdapterConfig(api_key=anthropic_key))
+
+        # Initialize Google adapter
+        google_key = os.getenv("GOOGLE_API_KEY")
+        if google_key:
+            adapters[Provider.GOOGLE] = GoogleAdapter(AdapterConfig(api_key=google_key))
 
     if not adapters:
         logger.warning("No providers configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY")
@@ -209,13 +225,23 @@ app = FastAPI(
 # ObservabilityMiddleware handles metrics, tracing, and logging in one place
 app.add_middleware(ObservabilityMiddleware, service_name="2api")
 
-# CORS middleware
+# CORS middleware (environment allowlist; safe defaults)
+_cors_origins = get_cors_allowed_origins()
+if not _cors_origins:
+    # Safe defaults for local/test only.
+    _cors_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ] if not is_prod_mode() else []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-Id", "X-Trace-Id"],
 )
 
 # Include all routers
@@ -336,10 +362,13 @@ async def get_usage(
             "request_count": 0
         }
 
+    if isinstance(tenant_usage, dict) and tenant_usage.get("tenant_id") is not None:
+        tenant_usage = {**tenant_usage, "tenant_id": str(tenant_usage["tenant_id"])}
+
     return JSONResponse(
         content={
             "object": "usage",
-            "tenant_id": auth.tenant_id,
+            "tenant_id": str(auth.tenant_id) if auth.tenant_id else None,
             "data": tenant_usage,
             "note": "In-memory usage data. For historical data, query the database."
         },

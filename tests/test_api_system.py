@@ -618,6 +618,100 @@ class TestGetAdapterForModel:
 
     def test_defaults_to_openai(self):
         """Test that it defaults to OpenAI for unknown models."""
+
+
+# ============================================================
+# API Correctness Regression Tests
+# ============================================================
+
+class TestApiCorrectnessRegression:
+    """Regression tests for route correctness conflicts."""
+
+    @staticmethod
+    def _mock_auth_context():
+        """Create a deterministic auth context for route tests."""
+        from datetime import datetime
+        from uuid import UUID
+        from src.db.models import AuthContext, Tenant, APIKey
+
+        tenant_id = UUID("11111111-1111-1111-1111-111111111111")
+        api_key_id = UUID("22222222-2222-2222-2222-222222222222")
+
+        tenant = Tenant(
+            id=tenant_id,
+            name="Test Tenant",
+            email="test@example.com",
+            plan="pro",
+            is_active=True,
+            created_at=datetime.utcnow(),
+        )
+        api_key = APIKey(
+            id=api_key_id,
+            tenant_id=tenant_id,
+            key_hash="hash",
+            key_prefix="2api_test",
+            name="Test Key",
+            permissions=["*"],
+            rate_limit_per_minute=100,
+            is_active=True,
+            created_at=datetime.utcnow(),
+        )
+
+        return AuthContext(
+            tenant_id=tenant_id,
+            api_key_id=api_key_id,
+            tenant=tenant,
+            api_key=api_key,
+            permissions=["*"],
+            rate_limit_per_minute=100,
+            request_id="req_test_models_compare",
+            trace_id="trace_test_models_compare",
+        )
+
+    def test_models_compare_route_not_captured_by_model_path(self):
+        """/v1/models/compare must resolve to compare handler, not model lookup."""
+        from src.api.routes.models import router as models_router
+        from src.auth.middleware import get_auth_context
+        from src.api.dependencies import get_router
+
+        app = FastAPI()
+        app.include_router(models_router)
+        app.dependency_overrides[get_auth_context] = self._mock_auth_context
+
+        mock_router = Mock()
+        mock_router.list_all_models.return_value = []
+        app.dependency_overrides[get_router] = lambda: mock_router
+
+        client = TestClient(app)
+        response = client.get(
+            "/v1/models/compare",
+            params={"input_tokens": 1000, "output_tokens": 500, "capability": "chat"},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["object"] == "list"
+        assert "query" in payload
+        assert payload["query"]["input_tokens"] == 1000
+
+    def test_usage_route_contract_is_unique_on_server_app(self):
+        """Server app should expose exactly one /v1/usage route with stable contract."""
+        from src.server import app
+
+        usage_routes = [
+            route
+            for route in app.router.routes
+            if getattr(route, "path", None) == "/v1/usage"
+        ]
+
+        assert len(usage_routes) == 1
+
+        admin_usage_routes = [
+            route
+            for route in app.router.routes
+            if getattr(route, "path", None) == "/v1/admin/usage"
+        ]
+        assert len(admin_usage_routes) == 1
         from src.api.routes.chat import _get_adapter_for_model
         from src.core.models import Provider
 

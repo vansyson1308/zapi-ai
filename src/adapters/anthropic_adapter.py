@@ -35,7 +35,6 @@ from ..core.models import (
 from ..core.errors import (
     TwoApiException,
     handle_anthropic_error,
-    create_stream_error_chunk,
     StreamInterruptedError,
 )
 
@@ -194,13 +193,11 @@ class AnthropicAdapter(BaseAdapter):
                             error_data = data.get("error", {})
                             error_msg = error_data.get("message", "Unknown streaming error")
                             if content_started:
-                                error = StreamInterruptedError(
+                                raise StreamInterruptedError(
                                     provider="anthropic",
                                     partial_content=partial_content,
                                     request_id=request_id
                                 )
-                                yield create_stream_error_chunk(error, partial_content)
-                                return
                             else:
                                 from ..core.errors import InfraError, ErrorDetails, ErrorType
                                 raise InfraError(
@@ -249,20 +246,21 @@ class AnthropicAdapter(BaseAdapter):
 
         except TwoApiException:
             if content_started:
-                error = StreamInterruptedError(
+                raise StreamInterruptedError(
                     provider="anthropic",
                     partial_content=partial_content,
                     request_id=request_id
                 )
-                yield create_stream_error_chunk(error, partial_content)
-                return
             raise
 
         except Exception as e:
             error = handle_anthropic_error(e, request_id)
             if content_started:
-                yield create_stream_error_chunk(error, partial_content)
-                return
+                raise StreamInterruptedError(
+                    provider="anthropic",
+                    partial_content=partial_content,
+                    request_id=request_id
+                )
             raise error
 
     async def embedding(

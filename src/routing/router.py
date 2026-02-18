@@ -9,6 +9,7 @@ Intelligent routing between AI providers with:
 """
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, AsyncIterator
@@ -35,6 +36,7 @@ from ..core.errors import (
     StreamInterruptedError,
     ErrorDetails,
     ErrorType,
+    create_stream_error_chunk,
 )
 from ..adapters.base import BaseAdapter, ProviderHealth
 
@@ -52,6 +54,8 @@ from .fallback import (
     RequestPhaseTracker,
 )
 from .health import HealthRegistry
+from ..streaming.normalizer import StreamNormalizer
+from ..streaming.tool_calls import ToolCallStreamTracker
 
 
 @dataclass
@@ -291,107 +295,155 @@ class Router:
         request_id: str
     ) -> AsyncIterator[str]:
         """
-        Route a streaming chat completion request.
+        Route a streaming chat completion request through unified orchestration.
 
-        IMPORTANT: Implements semantic drift protection.
-        Once content is streamed, NO fallback is allowed.
-
-        Args:
-            request: Chat completion request (stream=True)
-            request_id: Request ID for tracking
-
-        Yields:
-            SSE-formatted chunks
+        This is the single source of truth for streaming routing/fallback semantics.
         """
-        start_time = time.time()
-
-        # Create phase tracker
         tracker = self._fallback_coordinator.create_tracker(request_id)
-        partial_content = ""
 
         try:
-            routing_result = self._select_provider(
+            routing_result = self._select_provider(request=request, capability="chat")
+
+            async for event in self._stream_with_provider(
                 request=request,
-                capability="chat"
+                request_id=request_id,
+                routing_result=routing_result,
+                tracker=tracker,
+            ):
+                yield event
+
+        except TwoApiException as e:
+            # fallback only allowed before first content
+            if tracker.can_fallback() and request.routing and request.routing.fallback:
+                async for event in self._try_fallback_stream(
+                    request=request,
+                    failed_provider=routing_result.selected_provider,
+                    fallback_chain=request.routing.fallback,
+                    tracker=tracker,
+                    request_id=request_id,
+                ):
+                    yield event
+            else:
+                partial = tracker.get_partial_content() or ""
+                yield create_stream_error_chunk(e, partial)
+
+        except Exception as e:
+            error = StreamInterruptedError(
+                provider=routing_result.selected_provider.value if 'routing_result' in locals() else "unknown",
+                partial_content=tracker.get_partial_content() or "",
+                request_id=request_id,
             )
-
-            adapter = routing_result.adapter
-            first_chunk = True
-
-            try:
-                async for chunk in adapter.chat_completion_stream(request, request_id):
-                    # Check if this chunk contains content
-                    if "delta" in chunk and "content" in chunk:
-                        content = chunk.get("delta", {}).get("content", "")
-                        if content:
-                            if first_chunk:
-                                # Mark content started - NO MORE FALLBACK after this
-                                tracker.mark_content_started(content)
-                                first_chunk = False
-                            else:
-                                tracker.append_content(content)
-                            partial_content += content
-
-                    yield chunk
-
-                # Success - record metrics
-                latency_ms = int((time.time() - start_time) * 1000)
-                self._record_success(routing_result.selected_provider, latency_ms)
-                tracker.mark_completed()
-
-            except TwoApiException as e:
-                latency_ms = int((time.time() - start_time) * 1000)
-                self._record_failure(
-                    routing_result.selected_provider,
-                    str(e),
-                    latency_ms
-                )
-
-                # Check if fallback allowed
-                if tracker.can_fallback() and request.routing and request.routing.fallback:
-                    # Retry with fallback
-                    async for chunk in self._try_fallback_stream(
-                        request=request,
-                        failed_provider=routing_result.selected_provider,
-                        fallback_chain=request.routing.fallback,
-                        tracker=tracker,
-                        request_id=request_id
-                    ):
-                        yield chunk
-                else:
-                    # NO FALLBACK - Return error with partial content
-                    raise StreamInterruptedError(
-                        provider=routing_result.selected_provider.value,
-                        partial_content=tracker.get_partial_content() or "",
-                        request_id=request_id
-                    )
-
-            except Exception as e:
-                latency_ms = int((time.time() - start_time) * 1000)
-                self._record_failure(
-                    routing_result.selected_provider,
-                    str(e),
-                    latency_ms
-                )
-
-                if tracker.can_fallback() and request.routing and request.routing.fallback:
-                    async for chunk in self._try_fallback_stream(
-                        request=request,
-                        failed_provider=routing_result.selected_provider,
-                        fallback_chain=request.routing.fallback,
-                        tracker=tracker,
-                        request_id=request_id
-                    ):
-                        yield chunk
-                else:
-                    raise StreamInterruptedError(
-                        provider=routing_result.selected_provider.value,
-                        partial_content=tracker.get_partial_content() or "",
-                        request_id=request_id
-                    )
+            yield create_stream_error_chunk(error, tracker.get_partial_content() or "")
 
         finally:
             self._fallback_coordinator.cleanup_tracker(request_id)
+
+    async def _stream_with_provider(
+        self,
+        request: ChatCompletionRequest,
+        request_id: str,
+        routing_result: RoutingResult,
+        tracker: RequestPhaseTracker,
+    ) -> AsyncIterator[str]:
+        """Stream using one provider and normalize all chunks consistently."""
+        start_time = time.time()
+        adapter = routing_result.adapter
+        provider_name = routing_result.selected_provider.value
+        normalizer = StreamNormalizer(model=request.model_name, provider=provider_name, request_id=request_id)
+        tool_tracker = ToolCallStreamTracker()
+
+        try:
+            async for raw_chunk in adapter.chat_completion_stream(request, request_id):
+                normalized_events = self._normalize_raw_stream_chunk(raw_chunk, normalizer, provider_name, tool_tracker)
+
+                for evt in normalized_events:
+                    if evt.startswith("data: [DONE]"):
+                        yield evt
+                        latency_ms = int((time.time() - start_time) * 1000)
+                        self._record_success(routing_result.selected_provider, latency_ms)
+                        tracker.mark_completed()
+                        return
+
+                    # inspect payload for content start tracking
+                    try:
+                        payload = evt[len("data: "):].strip()
+                        parsed = json.loads(payload)
+                        choice = (parsed.get("choices") or [{}])[0]
+                        delta = choice.get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            if tracker.can_fallback():
+                                tracker.mark_content_started(content)
+                            else:
+                                tracker.append_content(content)
+
+                        for tc in delta.get("tool_calls", []) or []:
+                            f = tc.get("function", {})
+                            tool_tracker.update_call(
+                                index=tc.get("index", 0),
+                                id=tc.get("id"),
+                                function_name=f.get("name"),
+                                arguments_delta=f.get("arguments", ""),
+                            )
+                    except Exception:
+                        pass
+
+                    yield evt
+
+            # adapters may return without [DONE] - enforce termination
+            yield normalizer.create_done_event()
+            latency_ms = int((time.time() - start_time) * 1000)
+            self._record_success(routing_result.selected_provider, latency_ms)
+            tracker.mark_completed()
+
+        except TwoApiException:
+            latency_ms = int((time.time() - start_time) * 1000)
+            self._record_failure(routing_result.selected_provider, "stream_error", latency_ms)
+            raise
+        except Exception:
+            latency_ms = int((time.time() - start_time) * 1000)
+            self._record_failure(routing_result.selected_provider, "stream_error", latency_ms)
+            raise
+
+    def _normalize_raw_stream_chunk(
+        self,
+        raw_chunk: str,
+        normalizer: StreamNormalizer,
+        provider_name: str,
+        tool_tracker: ToolCallStreamTracker,
+    ) -> List[str]:
+        """Normalize provider chunk(s) into OpenAI-compatible SSE events."""
+        events: List[str] = []
+
+        if not isinstance(raw_chunk, str):
+            return events
+
+        lines = [ln.strip() for ln in raw_chunk.splitlines() if ln.strip()]
+        for line in lines:
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                events.append("data: [DONE]\n\n")
+                continue
+
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+
+            chunk = None
+            if provider_name == "anthropic" and "type" in data:
+                chunk = normalizer.normalize_anthropic_event(data.get("type"), data)
+            elif provider_name == "google" and "candidates" in data:
+                chunk = normalizer.normalize_google_chunk(data)
+            else:
+                chunk = normalizer.normalize_openai_chunk(data)
+
+            if chunk is not None:
+                events.append(chunk.to_sse())
+
+        return events
 
     async def route_embedding(
         self,
@@ -667,7 +719,7 @@ class Router:
         tracker: RequestPhaseTracker,
         request_id: str
     ) -> AsyncIterator[str]:
-        """Try fallback for streaming request."""
+        """Try fallback providers for streaming request before content starts."""
         chain = create_fallback_chain(
             primary=f"{failed_provider.value}/failed",
             fallback_list=fallback_chain
@@ -704,46 +756,38 @@ class Router:
                 metadata=request.metadata
             )
 
-            start_time = time.time()
+            routing_result = RoutingResult(
+                selected_provider=provider,
+                selected_model=model_name or "auto",
+                adapter=self.adapters[provider],
+                decision=RoutingDecision(strategy_used="fallback", candidates_evaluated=fallback_chain, fallback_used=True),
+            )
 
             try:
-                adapter = self.adapters[provider]
-
-                if not model_name:
-                    models = adapter.list_models()
-                    chat_models = [m for m in models if m.supports("chat")]
-                    if chat_models:
-                        model_name = chat_models[0].name
-
-                async for chunk in adapter.chat_completion_stream(fallback_request, request_id):
-                    # Track content for this fallback attempt
-                    if "delta" in str(chunk) and tracker.phase.value == "pre_content":
-                        tracker.mark_content_started("")
-
-                    yield chunk
-
-                latency_ms = int((time.time() - start_time) * 1000)
-                self._record_success(provider, latency_ms)
+                async for evt in self._stream_with_provider(
+                    request=fallback_request,
+                    request_id=request_id,
+                    routing_result=routing_result,
+                    tracker=tracker,
+                ):
+                    yield evt
                 return
 
             except Exception as e:
-                latency_ms = int((time.time() - start_time) * 1000)
-                self._record_failure(provider, str(e), latency_ms)
-
-                # If content was streamed during this fallback attempt, we can't retry
+                self._record_failure(provider, str(e))
                 if not tracker.can_fallback():
-                    raise StreamInterruptedError(
+                    err = StreamInterruptedError(
                         provider=provider_name,
                         partial_content=tracker.get_partial_content() or "",
-                        request_id=request_id
+                        request_id=request_id,
                     )
+                    yield create_stream_error_chunk(err, tracker.get_partial_content() or "")
+                    return
                 continue
 
         # All fallbacks failed
-        raise AllProvidersFailedError(
-            providers=fallback_chain,
-            request_id=request_id
-        )
+        err = AllProvidersFailedError(providers=fallback_chain, request_id=request_id)
+        yield create_stream_error_chunk(err)
 
     async def check_all_health(self) -> Dict[Provider, ProviderHealth]:
         """Check health of all providers."""

@@ -29,7 +29,7 @@ from ...usage import (
 )
 
 from ..models import EmbeddingRequest, EmbeddingResponse
-from ..dependencies import get_router, add_standard_headers, start_request_tracking
+from ..dependencies import get_router, add_standard_headers, start_request_tracking, check_rate_limits
 
 
 router = APIRouter(prefix="/v1", tags=["embeddings"])
@@ -39,6 +39,7 @@ router = APIRouter(prefix="/v1", tags=["embeddings"])
 async def create_embedding(
     body: EmbeddingRequest,
     auth: AuthContext = Depends(get_auth_context),
+    _: None = Depends(check_rate_limits),
     router_instance: Router = Depends(get_router)
 ):
     """

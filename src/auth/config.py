@@ -1,12 +1,12 @@
 """
 2api.ai - Auth Configuration
 
-Handles local vs production mode for authentication.
+Handles local vs production mode for authentication and startup safety checks.
 """
 
 import os
 from enum import Enum
-from typing import Optional
+from typing import List
 
 
 class AuthMode(str, Enum):
@@ -14,22 +14,25 @@ class AuthMode(str, Enum):
 
     LOCAL = "local"  # Relaxed auth for development (format-check only)
     PROD = "prod"    # Full DB-backed auth
+    TEST = "test"    # Deterministic test mode (in-memory quotas)
 
 
 def get_auth_mode() -> AuthMode:
     """
     Get the current authentication mode.
 
-    Set via MODE environment variable:
-    - MODE=local: Development mode, relaxed auth
-    - MODE=prod: Production mode, full DB auth
+    MODE must be one of: local, prod/production, test.
 
-    Default: local (for vibe coding friendliness)
+    Default: prod (fail-closed default for safer deployments).
     """
-    mode = os.getenv("MODE", "local").lower()
-    if mode == "prod" or mode == "production":
+    mode = os.getenv("MODE", "prod").lower().strip()
+    if mode in {"prod", "production"}:
         return AuthMode.PROD
-    return AuthMode.LOCAL
+    if mode == "local":
+        return AuthMode.LOCAL
+    if mode == "test":
+        return AuthMode.TEST
+    raise ValueError("Invalid MODE. Use one of: local, prod, production, test")
 
 
 def is_local_mode() -> bool:
@@ -59,3 +62,39 @@ def get_local_env_keys() -> dict:
         "anthropic": os.getenv("ANTHROPIC_API_KEY"),
         "google": os.getenv("GOOGLE_API_KEY"),
     }
+
+
+def is_test_mode() -> bool:
+    """Check if running in test mode."""
+    return get_auth_mode() == AuthMode.TEST
+
+
+def get_cors_allowed_origins() -> List[str]:
+    """Parse CORS_ALLOW_ORIGINS from environment."""
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "")
+    if not raw.strip():
+        return []
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+def validate_security_config() -> None:
+    """Fail closed for unsafe production startup configuration."""
+    mode = get_auth_mode()
+    if mode in {AuthMode.LOCAL, AuthMode.TEST}:
+        return
+
+    # Production guardrails
+    if os.getenv("USE_STUB_ADAPTERS", "false").lower() in {"1", "true", "yes"}:
+        raise RuntimeError("USE_STUB_ADAPTERS is not allowed in production mode")
+
+    if not os.getenv("DATABASE_URL"):
+        raise RuntimeError("DATABASE_URL is required in production mode")
+
+    if not os.getenv("FERNET_KEY"):
+        raise RuntimeError("FERNET_KEY is required in production mode")
+
+    origins = get_cors_allowed_origins()
+    if not origins:
+        raise RuntimeError("CORS_ALLOW_ORIGINS must be set in production mode")
+    if "*" in origins:
+        raise RuntimeError("CORS_ALLOW_ORIGINS cannot include '*' in production mode")

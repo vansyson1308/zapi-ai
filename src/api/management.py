@@ -392,7 +392,7 @@ async def delete_provider(
 # Usage Endpoints
 # ============================================================
 
-@router.get("/usage")
+@router.get("/admin/usage")
 async def get_usage(
     start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),

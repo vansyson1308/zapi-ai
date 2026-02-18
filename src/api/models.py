@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ============================================================
@@ -69,8 +69,7 @@ class FunctionParameters(BaseModel):
     required: List[str] = Field(default_factory=list)
     additionalProperties: bool = False
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class FunctionDefinition(BaseModel):
