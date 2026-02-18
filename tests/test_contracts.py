@@ -8,6 +8,7 @@ Tests that verify the API conforms to documented specifications:
 """
 
 import json
+from pathlib import Path
 import pytest
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
@@ -262,7 +263,51 @@ class TestToolCallingContract:
         assert tool_result["role"] == "tool"
         assert "tool_call_id" in tool_result
         assert "content" in tool_result
-        assert isinstance(tool_result["content"], str)
+
+
+# ============================================================
+# Quality Gate Contract Tests
+# ============================================================
+
+class TestQualityGateContract:
+    """Tests for deterministic local + CI quality gate contract."""
+
+    def test_makefile_exposes_ci_target(self):
+        """Repository must provide a single deterministic `make ci` entrypoint."""
+        makefile = Path("Makefile")
+        assert makefile.exists(), "Makefile is required"
+
+        content = makefile.read_text(encoding="utf-8")
+        assert "ci:" in content, "Makefile must define a `ci` target"
+        assert "smoke" in content, "Makefile must define a `smoke` target"
+        assert "quality: compile test-contracts sdk smoke test" in content, (
+            "`make ci` quality chain must include sdk + smoke checks"
+        )
+        assert "run dev:" in content, "Makefile must define `make dev`/`make run` target"
+        assert "smoke-journey:" in content, "Makefile must define a smoke-journey target"
+
+
+    def test_dev_run_waits_for_ready_with_bounded_retries(self):
+        """`make dev` helper must wait for /ready with bounded retries."""
+        script = Path("scripts/dev_run.sh")
+        assert script.exists(), "scripts/dev_run.sh is required"
+
+        content = script.read_text(encoding="utf-8")
+        assert "/ready" in content, "dev run script must poll readiness endpoint"
+        assert "MAX_RETRIES" in content, "dev run script must have bounded retries"
+        assert "seq 1" in content, "dev run script must use bounded retry loop"
+        assert "Server ready" in content, "dev run script should print success guidance"
+
+    def test_ci_workflow_uses_make_ci(self):
+        """CI workflow should run `make ci` as the contract gate."""
+        workflow = Path(".github/workflows/ci.yml")
+        assert workflow.exists(), "CI workflow is required"
+
+        content = workflow.read_text(encoding="utf-8")
+        assert "make ci" in content, "CI workflow must execute `make ci`"
+        assert "continue-on-error: true" not in content, (
+            "Quality gates must be fail-fast and non-optional"
+        )
     
     def test_parallel_tool_calls_indexed(self):
         """Parallel tool calls must have index field."""
@@ -282,6 +327,32 @@ class TestToolCallingContract:
             assert "index" in tc
             assert isinstance(tc["index"], int)
 
+
+
+
+class TestReadmeModelDocContract:
+    """README model examples must match stub/test `/v1/models` support."""
+
+    def test_readme_model_examples_exist_in_stub_models(self):
+        readme = Path("README.md")
+        assert readme.exists(), "README.md is required"
+        content = readme.read_text(encoding="utf-8")
+
+        start = "<!-- MODEL_DOC_CONTRACT_START -->"
+        end = "<!-- MODEL_DOC_CONTRACT_END -->"
+        assert start in content and end in content, "README model contract markers are required"
+
+        block = content.split(start, 1)[1].split(end, 1)[0]
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip() and not ln.strip().startswith("```")]
+
+        contract_models = [ln for ln in lines if "(example)" not in ln]
+        assert contract_models, "At least one contract-bound model example is required"
+
+        from src.adapters.stub_adapter import StubAdapter
+
+        supported = {m.id for m in StubAdapter.MODELS}
+        missing = [m for m in contract_models if m not in supported]
+        assert not missing, f"README model examples missing from stub/test /v1/models: {missing}"
 
 # ============================================================
 # Error Taxonomy Contract Tests

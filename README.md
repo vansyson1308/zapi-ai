@@ -60,6 +60,14 @@
 
 ## Quick Start
 
+### One-command quality gate (from clean checkout)
+
+```bash
+make ci
+```
+
+This command installs dependencies and runs the deterministic repository quality gate (compile check + contract tests + full test suite).
+
 ### Using Python SDK
 
 ```python
@@ -311,17 +319,25 @@ curl http://localhost:8080/v1/chat/completions \
 
 ### Model Naming
 
-Models are specified as `provider/model-name`:
+Accepted model string formats:
 
-```
-openai/gpt-4o
+- `provider/model-name` (explicit provider + concrete model)
+- `auto` (let router strategy choose)
+- aliases may be supported depending on configured providers and adapter mapping
+
+Use `GET /v1/models` as the source of truth for what your current runtime supports.
+
+#### Model examples (stub/test doc contract)
+
+<!-- MODEL_DOC_CONTRACT_START -->
+```text
 openai/gpt-4o-mini
-anthropic/claude-3-5-sonnet
-anthropic/claude-3-opus
-google/gemini-1.5-pro
-google/gemini-1.5-flash
-auto  # Let 2api.ai choose based on routing strategy
+openai/text-embedding-3-small
+openai/gpt-4o (example)
 ```
+<!-- MODEL_DOC_CONTRACT_END -->
+
+- Entries marked `(example)` are illustrative only and not enforced by the doc-contract test.
 
 ### Routing Strategies
 
@@ -460,7 +476,7 @@ Sensitive fields (api_key, password, authorization) are automatically redacted.
 
 ## Environment Variables
 
-### Required (at least one provider)
+### Required
 
 ```bash
 OPENAI_API_KEY=sk-...
@@ -468,12 +484,18 @@ ANTHROPIC_API_KEY=sk-ant-...
 GOOGLE_API_KEY=AI...
 ```
 
-### Optional
+### Runtime + Security
 
 ```bash
 # Server
 PORT=8000
-MODE=local  # local or prod
+MODE=prod  # safe default; set MODE=local explicitly for local dev
+
+# Secret encryption for tenant provider keys
+FERNET_KEY=<generated_fernet_key>
+
+# CORS allowlist (required in prod; wildcard is rejected)
+CORS_ALLOW_ORIGINS=https://app.example.com,https://admin.example.com
 
 # Database & Cache
 DATABASE_URL=postgresql://user:pass@localhost:5432/twoapi
@@ -490,7 +512,48 @@ OTEL_CONSOLE_EXPORT=false
 # Usage Tracking
 USAGE_BUFFER_SIZE=100
 USAGE_FLUSH_INTERVAL=5.0
+
+# Rate Limiting / Quotas
+# MODE=test enables deterministic in-memory quota defaults for integration tests
+TEST_RATE_LIMIT_RPM=2
+TEST_DAILY_TOKEN_LIMIT=1000000
+TEST_MONTHLY_COST_LIMIT=1000
+
 ```
+
+---
+
+## Streaming contract
+
+Streaming responses follow OpenAI-compatible SSE chunks:
+
+- `data: { ...chat.completion.chunk... }`
+- terminal event: `data: [DONE]`
+
+### Guarantees
+- Streaming and non-streaming now share router-level routing/fallback/circuit-breaker orchestration.
+- Provider chunks are normalized at runtime through the StreamNormalizer pipeline.
+- Tool-call deltas are accumulated consistently via the streaming tool-call tracker.
+- If an error happens after partial content, the gateway emits one terminal error chunk followed by `[DONE]`.
+
+### Chunk shape (normalized)
+- `id`, `object=chat.completion.chunk`, `created`, `model`
+- `choices[0].delta` containing one of:
+  - `content`
+  - `tool_calls` deltas
+  - `role` (typically first chunk)
+- `choices[0].finish_reason` is `null` until final chunk.
+
+---
+
+## Compatibility Matrix
+
+| Component | Supported |
+|---|---|
+| Python | 3.10–3.12 (CI validated on 3.10/3.11) |
+| Node.js (JS SDK) | 18–22 |
+| npm | 9–11 |
+| OS | Linux/macOS; Windows via WSL2 recommended for parity |
 
 ---
 
@@ -501,6 +564,27 @@ USAGE_FLUSH_INTERVAL=5.0
 - Python 3.10+
 - Node.js 18+ (for JavaScript SDK)
 - Docker & Docker Compose
+
+### One-command local run (minimal deterministic mode)
+
+```bash
+make doctor
+make dev
+```
+
+This starts the API in `MODE=local` with stub adapters, waits until `/ready` returns 200, and prints the base URL plus suggested next commands.
+
+### Quality gate
+
+```bash
+make ci
+```
+
+### Final smoke user journey
+
+```bash
+make smoke-journey
+```
 
 ### Setup
 
@@ -533,6 +617,26 @@ pytest tests/test_sdk_system.py -v
 pytest tests/ --cov=src --cov-report=html
 ```
 
+## Troubleshooting
+
+### `make ci` fails at dependency install
+- Ensure Python and pip are available and up to date.
+- In restricted networks, configure package registry/proxy access for pip and npm.
+
+### Server fails to start in production mode
+- `MODE=prod` is fail-closed. You must set:
+  - `DATABASE_URL`
+  - `FERNET_KEY`
+  - `CORS_ALLOW_ORIGINS` (no wildcard)
+
+### Streaming smoke does not end with `[DONE]`
+- Confirm you are running in `MODE=local` with `USE_STUB_ADAPTERS=true` for deterministic behavior.
+- Re-run `make smoke` and `make smoke-journey`.
+
+### JS SDK validation fails
+- Ensure `src/sdk/javascript/package.json` contains `build`, `typecheck`, and `test:run` scripts.
+- Ensure `src/sdk/javascript/src/index.ts` exists.
+
 ---
 
 ## Documentation
@@ -545,6 +649,7 @@ pytest tests/ --cov=src --cov-report=html
 | [Tool Calling Spec](docs/TOOL_CALLING_SPEC.md) | Function calling normalization |
 | [Retry & Fallback](docs/RETRY_FALLBACK_POLICY.md) | Circuit breaker, retry policies |
 | [Multi-Tenant Design](docs/MULTI_TENANT_DESIGN.md) | Tenant isolation, billing |
+| [Security](SECURITY.md) | Threat model + safe deployment checklist |
 
 ---
 
@@ -553,9 +658,38 @@ pytest tests/ --cov=src --cov-report=html
 - **Never commit secrets**: `.env`, provider keys, or credentials
 - Keep `.env` in `.gitignore`
 - Use `--env-file .env` instead of `-e KEY=...` to avoid shell history leaks
-- Use a secrets manager in production
+- Use envelope encryption for tenant provider keys (`FERNET_KEY`)
+- In production, `MODE=prod` enforces fail-closed checks (`DATABASE_URL`, `FERNET_KEY`, `CORS_ALLOW_ORIGINS`)
 - If a key is exposed, **rotate it immediately**
 - Sensitive data is automatically redacted in logs
+- See [SECURITY.md](SECURITY.md) for limitations and deployment checklist
+
+## Final Release Checklist
+
+- [ ] `make dev` starts API in deterministic local mode.
+- [ ] `make smoke-journey` succeeds locally.
+- [ ] `make ci` passes with no manual steps.
+- [ ] `SECURITY.md` reviewed and production env variables configured.
+- [ ] Python and JS SDK validation checks pass.
+
+## Copy-paste commands
+
+```bash
+# 1) Minimal deterministic run
+make doctor
+make dev
+# expected: "✅ Server ready: http://127.0.0.1:8000"
+
+# 2) Real HTTP smoke checks
+make smoke
+# expected: "1 passed"
+make smoke-journey
+# expected final line: "Smoke user journey completed successfully."
+
+# 3) Full quality gate
+make ci
+# expected: all tests pass (e.g., "443 passed")
+```
 
 ---
 

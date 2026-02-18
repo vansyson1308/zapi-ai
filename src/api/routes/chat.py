@@ -47,7 +47,7 @@ from ..models import (
     ToolDefinition,
     RoutingConfig as RoutingInput,
 )
-from ..dependencies import get_router, add_standard_headers, start_request_tracking
+from ..dependencies import get_router, add_standard_headers, start_request_tracking, check_rate_limits
 
 
 router = APIRouter(prefix="/v1", tags=["chat"])
@@ -121,6 +121,7 @@ async def create_chat_completion(
     request: Request,
     body: ChatCompletionRequest,
     auth: AuthContext = Depends(get_auth_context),
+    _: None = Depends(check_rate_limits),
     router_instance: Router = Depends(get_router)
 ):
     """
@@ -176,26 +177,16 @@ async def _handle_streaming_request(
     auth: AuthContext,
     router_instance: Router
 ) -> StreamingResponse:
-    """Handle streaming chat completion request."""
+    """Handle streaming chat completion request via router orchestration."""
 
     async def generate() -> AsyncIterator[str]:
         tracker = start_request_tracking(auth, request.model, OperationType.CHAT_STREAM)
 
         try:
-            # Get appropriate adapter
-            adapter = _get_adapter_for_model(request.model, router_instance)
-
-            async for chunk in adapter.chat_completion_stream(
-                request,
-                request_id=auth.request_id
-            ):
-                # Track first token
-                if "content" in chunk and tracker._first_token_time is None:
+            async for chunk in router_instance.route_chat_stream(request, auth.request_id):
+                if "\"content\"" in chunk and tracker._first_token_time is None:
                     tracker.record_first_token()
-
                 yield chunk
-
-            # Complete tracking on success
             tracker.status = "success"
 
         except TwoApiException as e:
@@ -217,7 +208,6 @@ async def _handle_streaming_request(
             yield create_stream_error_chunk(error)
 
         finally:
-            # Complete tracking
             try:
                 await complete_tracking(tracker)
             except Exception:

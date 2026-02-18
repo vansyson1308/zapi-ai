@@ -51,13 +51,13 @@ from src.core.errors import (
 class TestModeDetection:
     """Test auth mode detection from environment."""
 
-    def test_default_mode_is_local(self):
-        """Default mode should be local when MODE env is not set."""
+    def test_default_mode_is_prod(self):
+        """Default mode should be prod when MODE env is not set."""
         with patch.dict(os.environ, {}, clear=True):
             # Remove MODE if it exists
             os.environ.pop("MODE", None)
             mode = get_auth_mode()
-            assert mode == AuthMode.LOCAL
+            assert mode == AuthMode.PROD
 
     def test_mode_local_explicit(self):
         """MODE=local should return LOCAL mode."""

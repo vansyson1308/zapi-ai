@@ -34,7 +34,6 @@ from ..core.models import (
 from ..core.errors import (
     TwoApiException,
     handle_openai_error,
-    create_stream_error_chunk,
     StreamInterruptedError,
 )
 
@@ -224,24 +223,22 @@ class OpenAIAdapter(BaseAdapter):
                         yield f"data: {data_str}\n\n"
 
         except TwoApiException:
-            # Re-raise our own exceptions
             if content_started:
-                # Content already sent - yield error chunk and stop
-                error = StreamInterruptedError(
+                raise StreamInterruptedError(
                     provider="openai",
                     partial_content=partial_content,
                     request_id=request_id
                 )
-                yield create_stream_error_chunk(error, partial_content)
-                return
             raise
 
         except Exception as e:
             error = handle_openai_error(e, request_id)
             if content_started:
-                # Content already sent - yield error chunk and stop
-                yield create_stream_error_chunk(error, partial_content)
-                return
+                raise StreamInterruptedError(
+                    provider="openai",
+                    partial_content=partial_content,
+                    request_id=request_id
+                )
             raise error
 
     async def embedding(

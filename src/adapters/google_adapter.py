@@ -33,7 +33,6 @@ from ..core.models import (
 from ..core.errors import (
     TwoApiException,
     handle_google_error,
-    create_stream_error_chunk,
     StreamInterruptedError,
 )
 
@@ -123,12 +122,13 @@ class GoogleAdapter(BaseAdapter):
         model_name = self._resolve_model_name(request.model_name)
         payload = self._build_chat_payload(request)
 
-        url = f"/models/{model_name}:generateContent?key={self.api_key}"
+        url = f"/models/{model_name}:generateContent"
+        headers = {"x-goog-api-key": self.api_key}
 
         start_time = time.time()
 
         try:
-            response = await self.client.post(url, json=payload)
+            response = await self.client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
         except Exception as e:
@@ -154,7 +154,8 @@ class GoogleAdapter(BaseAdapter):
         model_name = self._resolve_model_name(request.model_name)
         payload = self._build_chat_payload(request)
 
-        url = f"/models/{model_name}:streamGenerateContent?key={self.api_key}&alt=sse"
+        url = f"/models/{model_name}:streamGenerateContent?alt=sse"
+        headers = {"x-goog-api-key": self.api_key}
 
         partial_content = ""
         content_started = False
@@ -163,11 +164,12 @@ class GoogleAdapter(BaseAdapter):
             async with self.client.stream(
                 "POST",
                 url,
-                json=payload
+                json=payload,
+                headers=headers
             ) as response:
                 # Check for HTTP errors before streaming starts
                 if response.status_code >= 400:
-                    error_body = await response.aread()
+                    await response.aread()
                     class FakeError(httpx.HTTPStatusError):
                         def __init__(self):
                             self.response = response
@@ -190,13 +192,11 @@ class GoogleAdapter(BaseAdapter):
                             error_info = data["error"]
                             error_msg = error_info.get("message", "Unknown streaming error")
                             if content_started:
-                                error = StreamInterruptedError(
+                                raise StreamInterruptedError(
                                     provider="google",
                                     partial_content=partial_content,
                                     request_id=request_id
                                 )
-                                yield create_stream_error_chunk(error, partial_content)
-                                return
                             else:
                                 from ..core.errors import InfraError, ErrorDetails, ErrorType
                                 raise InfraError(
@@ -249,20 +249,21 @@ class GoogleAdapter(BaseAdapter):
 
         except TwoApiException:
             if content_started:
-                error = StreamInterruptedError(
+                raise StreamInterruptedError(
                     provider="google",
                     partial_content=partial_content,
                     request_id=request_id
                 )
-                yield create_stream_error_chunk(error, partial_content)
-                return
             raise
 
         except Exception as e:
             error = handle_google_error(e, request_id)
             if content_started:
-                yield create_stream_error_chunk(error, partial_content)
-                return
+                raise StreamInterruptedError(
+                    provider="google",
+                    partial_content=partial_content,
+                    request_id=request_id
+                )
             raise error
 
     async def embedding(
@@ -283,7 +284,8 @@ class GoogleAdapter(BaseAdapter):
         total_tokens = 0
 
         for i, text in enumerate(inputs):
-            url = f"/models/{model_name}:embedContent?key={self.api_key}"
+            url = f"/models/{model_name}:embedContent"
+            headers = {"x-goog-api-key": self.api_key}
             payload = {
                 "model": f"models/{model_name}",
                 "content": {
@@ -292,7 +294,7 @@ class GoogleAdapter(BaseAdapter):
             }
 
             try:
-                response = await self.client.post(url, json=payload)
+                response = await self.client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
                 data = response.json()
             except Exception as e:
@@ -348,8 +350,8 @@ class GoogleAdapter(BaseAdapter):
         """Check Google API health."""
         try:
             start = time.time()
-            url = f"/models?key={self.api_key}"
-            response = await self.client.get(url)
+            url = "/models"
+            response = await self.client.get(url, headers={"x-goog-api-key": self.api_key})
             latency = int((time.time() - start) * 1000)
             
             return ProviderHealth(

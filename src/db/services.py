@@ -5,10 +5,13 @@ Business logic for database operations.
 """
 
 import hashlib
+import os
 import secrets
 import json
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
+
+from ..security import KeyEncryptor, default_encryptor_from_env, OpenSSLEncryptor
 from uuid import UUID
 
 from .connection import DatabasePool
@@ -299,29 +302,25 @@ class ProviderConfigService:
     - Per-tenant provider settings
     """
 
-    def __init__(self, db: DatabasePool, encryption_key: Optional[str] = None):
+    def __init__(
+        self,
+        db: DatabasePool,
+        encryption_key: Optional[str] = None,
+        encryptor: Optional[KeyEncryptor] = None,
+    ):
         self.db = db
-        # For now, simple encryption. In production, use proper KMS.
-        self._encryption_key = encryption_key
+        # Pluggable encryptor interface; OpenSSL encryptor is the default baseline.
+        self._encryptor: KeyEncryptor = encryptor or (
+            OpenSSLEncryptor(encryption_key) if encryption_key else default_encryptor_from_env()
+        )
 
     def _encrypt(self, plaintext: str) -> str:
-        """
-        Encrypt sensitive data.
-
-        TODO: Replace with proper encryption (Fernet, KMS, etc.)
-        For now, just base64 encode as placeholder.
-        """
-        import base64
-        return base64.b64encode(plaintext.encode()).decode()
+        """Encrypt sensitive provider secrets before storage."""
+        return self._encryptor.encrypt(plaintext)
 
     def _decrypt(self, ciphertext: str) -> str:
-        """
-        Decrypt sensitive data.
-
-        TODO: Replace with proper decryption.
-        """
-        import base64
-        return base64.b64decode(ciphertext.encode()).decode()
+        """Decrypt sensitive provider secrets after retrieval."""
+        return self._encryptor.decrypt(ciphertext)
 
     async def set_provider_key(
         self,

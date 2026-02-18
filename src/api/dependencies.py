@@ -5,6 +5,7 @@ Shared dependencies for FastAPI routes.
 Provides common functionality used across endpoints.
 """
 
+import os
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -12,7 +13,7 @@ from typing import Any, Dict, Optional
 from fastapi import Depends, Header, Request
 
 from ..auth.middleware import get_auth_context
-from ..auth.config import is_local_mode
+from ..auth.config import is_local_mode, is_test_mode
 from ..db.models import AuthContext
 from ..core.errors import (
     InfraError,
@@ -83,44 +84,71 @@ async def get_request_context(
     }
 
 
+def _ensure_test_mode_quota(auth: AuthContext):
+    """Install deterministic in-memory quota defaults for TEST mode."""
+    from ..usage import QuotaConfig, UsageLimit, LimitType, LimitPeriod, set_quota, get_limiter
+
+    tenant_id = str(auth.tenant_id)
+    limiter = get_limiter()
+    if limiter.get_quota(tenant_id):
+        return
+
+    rpm_default = int(os.getenv("TEST_RATE_LIMIT_RPM", "2"))
+    token_daily_default = int(os.getenv("TEST_DAILY_TOKEN_LIMIT", "1000000"))
+    cost_monthly_default = float(os.getenv("TEST_MONTHLY_COST_LIMIT", "1000"))
+
+    plan = getattr(auth.tenant, "plan", "free") if getattr(auth, "tenant", None) else "free"
+    rpm_by_plan = {
+        "free": max(1, min(rpm_default, 2)),
+        "starter": max(2, rpm_default),
+        "pro": max(3, rpm_default),
+        "enterprise": max(5, rpm_default),
+    }
+    rpm_limit = rpm_by_plan.get(plan, rpm_default)
+
+    config = QuotaConfig(
+        tenant_id=tenant_id,
+        plan=plan,
+        limits=[
+            UsageLimit(LimitType.RATE, LimitPeriod.MINUTE, rpm_limit),
+            UsageLimit(LimitType.TOKENS, LimitPeriod.DAY, token_daily_default),
+            UsageLimit(LimitType.COST, LimitPeriod.MONTH, cost_monthly_default),
+        ],
+    )
+    set_quota(config)
+
+
 async def check_rate_limits(
     auth: AuthContext = Depends(get_auth_context),
     estimated_tokens: int = 0,
     estimated_cost: float = 0.0
 ):
-    """
-    Check rate limits for the request.
-
-    Raises if limits are exceeded.
-    """
-    from ..usage import LimitCheckResult
-
-    if is_local_mode():
-        # Skip rate limiting in local mode
+    """Check per-tenant limits and raise 429 on exceed."""
+    if is_local_mode() and not is_test_mode():
+        # Keep local mode frictionless for developer workflows.
         return
+
+    if is_test_mode():
+        _ensure_test_mode_quota(auth)
 
     result = await check_limits(
         tenant_id=str(auth.tenant_id),
-        tokens=estimated_tokens,
-        cost=estimated_cost
+        tokens=max(estimated_tokens, 1),
+        cost=estimated_cost,
     )
 
     if not result.allowed:
-        # Find the first exceeded limit
+        from ..core.errors import TenantRateLimitedError
+
         exceeded = result.exceeded_limits[0] if result.exceeded_limits else None
+        limit_name = exceeded.limit.name if exceeded else "requests_per_minute"
+        limit_value = int(exceeded.limit.limit_value) if exceeded else 0
 
-        from ..core.errors import RateLimitedError
-
-        raise RateLimitedError(
-            ErrorDetails(
-                code="rate_limit_exceeded",
-                message=f"Rate limit exceeded: {exceeded.limit.name if exceeded else 'unknown'}",
-                type=ErrorType.SEMANTIC,
-                request_id=auth.request_id,
-                retryable=True,
-                retry_after=result.retry_after or 60
-            ),
-            status_code=429
+        raise TenantRateLimitedError(
+            limit_type=limit_name,
+            limit=limit_value,
+            retry_after=result.retry_after or 60,
+            request_id=auth.request_id,
         )
 
 

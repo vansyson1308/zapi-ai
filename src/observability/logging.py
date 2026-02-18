@@ -123,8 +123,9 @@ class JSONFormatter(logging.Formatter):
 
     # Fields to redact from logs
     SENSITIVE_FIELDS = {
-        "password", "secret", "token", "api_key", "apikey",
+        "password", "secret", "token", "api_key", "apikey", "key",
         "authorization", "auth", "credential", "private_key",
+        "fernet", "master_key",
     }
 
     def __init__(

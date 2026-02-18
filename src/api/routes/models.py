@@ -88,6 +88,49 @@ async def list_models(
     )
 
 
+@router.get("/models/compare")
+async def compare_models(
+    input_tokens: int = Query(..., ge=0, description="Number of input tokens"),
+    output_tokens: int = Query(..., ge=0, description="Number of output tokens"),
+    capability: str = Query("chat", description="Required capability"),
+    auth: AuthContext = Depends(get_auth_context)
+):
+    """
+    Compare costs across models for a given usage.
+
+    **Example:**
+    ```
+    GET /v1/models/compare?input_tokens=10000&output_tokens=5000&capability=chat
+    ```
+
+    Returns models sorted by cost from cheapest to most expensive.
+    """
+    from ...usage import compare_costs
+
+    comparison = compare_costs(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        capability=capability
+    )
+
+    headers = add_standard_headers({}, auth)
+
+    return JSONResponse(
+        content={
+            "object": "list",
+            "query": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "capability": capability
+            },
+            "data": comparison
+        },
+        headers=headers
+    )
+
+
+
+
 @router.get("/models/{model_id:path}")
 async def get_model(
     model_id: str,
@@ -148,47 +191,6 @@ async def get_model(
                 "batch_input_per_1m": price.batch_input_per_1m if price else None,
                 "batch_output_per_1m": price.batch_output_per_1m if price else None,
             }
-        },
-        headers=headers
-    )
-
-
-@router.get("/models/compare")
-async def compare_models(
-    input_tokens: int = Query(..., ge=0, description="Number of input tokens"),
-    output_tokens: int = Query(..., ge=0, description="Number of output tokens"),
-    capability: str = Query("chat", description="Required capability"),
-    auth: AuthContext = Depends(get_auth_context)
-):
-    """
-    Compare costs across models for a given usage.
-
-    **Example:**
-    ```
-    GET /v1/models/compare?input_tokens=10000&output_tokens=5000&capability=chat
-    ```
-
-    Returns models sorted by cost from cheapest to most expensive.
-    """
-    from ...usage import compare_costs
-
-    comparison = compare_costs(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        capability=capability
-    )
-
-    headers = add_standard_headers({}, auth)
-
-    return JSONResponse(
-        content={
-            "object": "list",
-            "query": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "capability": capability
-            },
-            "data": comparison
         },
         headers=headers
     )
