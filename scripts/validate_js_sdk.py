@@ -52,6 +52,24 @@ def main() -> int:
         print("ERROR: npm pack --dry-run failed")
         return 1
 
+
+    # Run lightweight node-based sanity checks (offline-friendly):
+    # - npm pack --dry-run metadata
+    # - fixed SSE [DONE] parser sanity
+    sanity = ROOT / "scripts" / "js_sdk_sanity.mjs"
+    sanity_proc = subprocess.run(
+        ["node", str(sanity)],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if sanity_proc.returncode != 0:
+        print(sanity_proc.stdout)
+        print(sanity_proc.stderr)
+        print("ERROR: node JS SDK sanity check failed")
+        return 1
+
     print("JS SDK validation passed")
     return 0
 

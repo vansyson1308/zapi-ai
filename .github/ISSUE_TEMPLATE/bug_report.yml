@@ -1,0 +1,96 @@
+name: Bug Report
+description: Report a reproducible defect with enough detail for maintainers to act.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please provide concrete reproduction details.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is broken?
+      placeholder: Short description of the issue.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands/inputs to reproduce.
+      placeholder: |
+        1. Run `...`
+        2. Call `...`
+        3. Observe `...`
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs/output
+      description: Paste relevant error logs, stack traces, or HTTP responses.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: `make doctor` output
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: ci
+    attributes:
+      label: `make ci` output
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "e.g., Ubuntu 22.04 / macOS 14 / Windows 11 (WSL2)"
+    validations:
+      required: true
+
+  - type: input
+    id: python_version
+    attributes:
+      label: Python version
+      placeholder: "e.g., 3.10.19"
+    validations:
+      required: true
+
+  - type: input
+    id: node_version
+    attributes:
+      label: Node version
+      placeholder: "e.g., 20.11.1"
+    validations:
+      required: true

@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 from fastapi import Depends, Header, Request
 
 from ..auth.middleware import get_auth_context
-from ..auth.config import is_local_mode, is_test_mode
+from ..auth.config import is_local_mode, is_test_mode, is_strict_local_guards_enabled
 from ..db.models import AuthContext
 from ..core.errors import (
     InfraError,
@@ -124,7 +124,7 @@ async def check_rate_limits(
     estimated_cost: float = 0.0
 ):
     """Check per-tenant limits and raise 429 on exceed."""
-    if is_local_mode() and not is_test_mode():
+    if is_local_mode() and not is_test_mode() and not is_strict_local_guards_enabled():
         # Keep local mode frictionless for developer workflows.
         return
 
