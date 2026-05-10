@@ -7,7 +7,7 @@ Compatible with OpenAI's Chat Completions API.
 
 import json
 import time
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -39,6 +39,8 @@ from ...usage import (
     complete_tracking,
     estimate_request_cost,
 )
+from ...agentops.middleware import get_attribution
+from ...agentops import Guardian, AttributionContext
 
 from ..models import (
     ChatCompletionRequest,
@@ -116,6 +118,25 @@ def convert_routing(routing: RoutingInput) -> RoutingConfig:
 # Chat Completions Endpoint
 # ============================================================
 
+def _resolve_attribution(
+    request: Request,
+    auth: AuthContext,
+) -> AttributionContext:
+    """Combine middleware-extracted attribution with auth-derived identifiers."""
+    attribution = get_attribution(request)
+    # Auth runs after middleware, so we merge in tenant/api_key here.
+    if not attribution.tenant_id and auth.tenant_id:
+        attribution.tenant_id = str(auth.tenant_id)
+    if not attribution.api_key_id and auth.api_key_id:
+        attribution.api_key_id = str(auth.api_key_id)
+    return attribution
+
+
+def _resolve_guardian(request: Request) -> Optional[Guardian]:
+    """Pull the Guardian off app.state if it's been initialized."""
+    return getattr(request.app.state, "agentops_guardian", None)
+
+
 @router.post("/chat/completions")
 async def create_chat_completion(
     request: Request,
@@ -134,7 +155,12 @@ async def create_chat_completion(
     - `openai/gpt-4o` - Specific provider and model
     - `anthropic/claude-3-5-sonnet` - Anthropic model
     - `google/gemini-1.5-pro` - Google model
+    - `openrouter/anthropic/claude-3.5-sonnet` - via OpenRouter passthrough
     - `auto` - Let 2api.ai choose the best model
+
+    **AgentOps headers:**
+    - `X-Customer-Id`, `X-Feature-Id`, `X-Agent-Id` — populate Guardian
+      attribution dimensions for kill switches + per-customer billing.
 
     **Streaming:**
     Set `stream: true` to receive Server-Sent Events (SSE).
@@ -156,31 +182,48 @@ async def create_chat_completion(
         metadata=body.metadata
     )
 
+    attribution = _resolve_attribution(request, auth)
+    guardian = _resolve_guardian(request)
+
     # Handle streaming
     if body.stream:
         return await _handle_streaming_request(
             internal_request,
             auth,
-            router_instance
+            router_instance,
+            attribution,
+            guardian,
         )
 
     # Handle non-streaming
     return await _handle_non_streaming_request(
         internal_request,
         auth,
-        router_instance
+        router_instance,
+        attribution,
+        guardian,
     )
 
 
 async def _handle_streaming_request(
     request: InternalRequest,
     auth: AuthContext,
-    router_instance: Router
+    router_instance: Router,
+    attribution: AttributionContext,
+    guardian: Optional[Guardian],
 ) -> StreamingResponse:
     """Handle streaming chat completion request via router orchestration."""
 
     async def generate() -> AsyncIterator[str]:
-        tracker = start_request_tracking(auth, request.model, OperationType.CHAT_STREAM)
+        tracker = start_request_tracking(
+            auth,
+            request.model,
+            OperationType.CHAT_STREAM,
+            customer_id=attribution.customer_id,
+            feature_id=attribution.feature_id,
+            agent_id=attribution.agent_id,
+            session_id=attribution.session_id,
+        )
 
         try:
             async for chunk in router_instance.route_chat_stream(request, auth.request_id):
@@ -209,7 +252,14 @@ async def _handle_streaming_request(
 
         finally:
             try:
-                await complete_tracking(tracker)
+                record = await complete_tracking(tracker)
+                if guardian is not None:
+                    await guardian.record_usage(
+                        attribution=attribution,
+                        actual_usd=record.cost_usd,
+                        actual_tokens=record.total_tokens,
+                        request_id=auth.request_id,
+                    )
             except Exception:
                 pass
 
@@ -228,10 +278,20 @@ async def _handle_streaming_request(
 async def _handle_non_streaming_request(
     request: InternalRequest,
     auth: AuthContext,
-    router_instance: Router
+    router_instance: Router,
+    attribution: AttributionContext,
+    guardian: Optional[Guardian],
 ) -> JSONResponse:
     """Handle non-streaming chat completion request."""
-    tracker = start_request_tracking(auth, request.model, OperationType.CHAT)
+    tracker = start_request_tracking(
+        auth,
+        request.model,
+        OperationType.CHAT,
+        customer_id=attribution.customer_id,
+        feature_id=attribution.feature_id,
+        agent_id=attribution.agent_id,
+        session_id=attribution.session_id,
+    )
 
     try:
         # Route the request
@@ -253,6 +313,15 @@ async def _handle_non_streaming_request(
 
         # Complete tracking
         record = await complete_tracking(tracker)
+
+        # Update Guardian budget counters (post-record).
+        if guardian is not None:
+            await guardian.record_usage(
+                attribution=attribution,
+                actual_usd=record.cost_usd,
+                actual_tokens=record.total_tokens,
+                request_id=auth.request_id,
+            )
 
         # Build response headers
         headers = add_standard_headers(

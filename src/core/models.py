@@ -22,6 +22,8 @@ class Provider(str, Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     GOOGLE = "google"
+    # Aggregator gateways — we sit ON TOP of these, not against them.
+    OPENROUTER = "openrouter"
 
 
 class Role(str, Enum):

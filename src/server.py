@@ -37,8 +37,14 @@ from .adapters.base import AdapterConfig
 from .adapters.openai_adapter import OpenAIAdapter
 from .adapters.anthropic_adapter import AnthropicAdapter
 from .adapters.google_adapter import GoogleAdapter
+from .adapters.openrouter_adapter import OpenRouterAdapter
 from .adapters.stub_adapter import StubAdapter
 from .routing.router import Router
+
+# AgentOps imports
+from .agentops import Guardian
+from .agentops.middleware import AgentOpsMiddleware
+from .api.agentops_routes import router as agentops_router
 
 # Auth imports
 from .auth.middleware import get_auth_context
@@ -152,12 +158,24 @@ async def lifespan(app: FastAPI):
         if google_key:
             adapters[Provider.GOOGLE] = GoogleAdapter(AdapterConfig(api_key=google_key))
 
+        # Initialize OpenRouter passthrough adapter (we sit ON TOP of OpenRouter)
+        openrouter_key = os.getenv("OPENROUTER_API_KEY")
+        if openrouter_key:
+            adapters[Provider.OPENROUTER] = OpenRouterAdapter(AdapterConfig(api_key=openrouter_key))
+
     if not adapters:
         logger.warning("No providers configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY")
     else:
         logger.info(f"Providers initialized: {', '.join(p.value for p in adapters.keys())}")
 
     router_instance = Router(adapters)
+
+    # Initialize AgentOps Guardian and stash on app.state so routes can find it.
+    # NOTE: stub adapters mode keeps Guardian alive but with no caps registered;
+    # operators add caps via POST /v1/agentops/budgets.
+    guardian = Guardian()
+    app.state.agentops_guardian = guardian
+    logger.info("AgentOps Guardian initialized")
 
     # Run health check and record metrics
     metrics = get_metrics()
@@ -222,8 +240,12 @@ app = FastAPI(
 )
 
 # Add custom middleware (order matters - first added = outermost)
-# ObservabilityMiddleware handles metrics, tracing, and logging in one place
+# ObservabilityMiddleware handles metrics, tracing, and logging in one place.
+# AgentOpsMiddleware runs INSIDE observability so its errors get traced.
 app.add_middleware(ObservabilityMiddleware, service_name="2api")
+# Lazy guardian: middleware constructs its own default Guardian if app.state
+# isn't yet set (during startup before lifespan completes).
+app.add_middleware(AgentOpsMiddleware)
 
 # CORS middleware (environment allowlist; safe defaults)
 _cors_origins = get_cors_allowed_origins()
@@ -250,6 +272,7 @@ app.include_router(chat_router)
 app.include_router(embeddings_router)
 app.include_router(images_router)
 app.include_router(models_router)
+app.include_router(agentops_router)
 
 
 # ============================================================
