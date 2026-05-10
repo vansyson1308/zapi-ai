@@ -9,6 +9,7 @@ from .base import BaseAdapter, AdapterConfig, ProviderHealth
 from .openai_adapter import OpenAIAdapter
 from .anthropic_adapter import AnthropicAdapter
 from .google_adapter import GoogleAdapter
+from .openrouter_adapter import OpenRouterAdapter
 
 __all__ = [
     "BaseAdapter",
@@ -17,20 +18,21 @@ __all__ = [
     "OpenAIAdapter",
     "AnthropicAdapter",
     "GoogleAdapter",
+    "OpenRouterAdapter",
 ]
 
 
 def get_adapter(provider: str, config: AdapterConfig) -> BaseAdapter:
     """
     Factory function to get the appropriate adapter for a provider.
-    
+
     Args:
-        provider: Provider name ("openai", "anthropic", "google")
+        provider: Provider name ("openai", "anthropic", "google", "openrouter")
         config: Adapter configuration with API key
-        
+
     Returns:
         Configured adapter instance
-        
+
     Raises:
         ValueError: If provider is not supported
     """
@@ -38,10 +40,11 @@ def get_adapter(provider: str, config: AdapterConfig) -> BaseAdapter:
         "openai": OpenAIAdapter,
         "anthropic": AnthropicAdapter,
         "google": GoogleAdapter,
+        "openrouter": OpenRouterAdapter,
     }
-    
+
     adapter_class = adapters.get(provider.lower())
     if not adapter_class:
         raise ValueError(f"Unsupported provider: {provider}")
-    
+
     return adapter_class(config)

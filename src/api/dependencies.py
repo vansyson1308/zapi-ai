@@ -155,7 +155,11 @@ async def check_rate_limits(
 def start_request_tracking(
     auth: AuthContext,
     model: str,
-    operation: OperationType = OperationType.CHAT
+    operation: OperationType = OperationType.CHAT,
+    customer_id: Optional[str] = None,
+    feature_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> RequestTracker:
     """
     Start tracking a request.
@@ -172,7 +176,11 @@ def start_request_tracking(
         api_key_id=str(auth.api_key_id),
         model=model,
         provider=provider,
-        operation=operation
+        operation=operation,
+        customer_id=customer_id,
+        feature_id=feature_id,
+        agent_id=agent_id,
+        session_id=session_id,
     )
 
 
